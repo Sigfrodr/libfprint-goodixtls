@@ -15,17 +15,39 @@ sensor's RAM through the `0xF2` memory command.
 > not distributed here to avoid shipping captured protocol data. Ask the author
 > if you need them for further work on the protocol.
 
+## At a glance
+
+- **Hardware** — Goodix **GXFP5187** SPI sensor (ACPI id `GXFP5187`), as found in
+  the Huawei MateBook X Pro (`MACH-WX9`); firmware `GF3288_ST411SEC_APP_11033`.
+- **What works** — enrolment and verification through `fprintd` and GNOME
+  Settings; session unlock and `sudo`. Open matcher, no NBIS, no Intel ME/SGX.
+- **Install** — `sudo ./install.sh` does everything (dependencies, build,
+  system settings, spidev bind). See [Building](#building) and the
+  [spidev prerequisite](#runtime-prerequisite-spidev-node) for the manual steps.
+- **Enrol / verify with on-screen guidance** — `python3 gx-verify.py`, see
+  [gx-verify.py](#testing-with-visible-feedback-gx-verifypy).
+
+**Contents** —
+[Why a dedicated matcher](#why-a-dedicated-matcher-and-not-nbis) ·
+[Usage](#usage) ·
+[Building](#building) ·
+[spidev prerequisite](#runtime-prerequisite-spidev-node) ·
+[The TLS channel](#the-tls-channel-the-systems-openssl-out-of-spec-record-decrypted-by-hand) ·
+[Architecture](#architecture) ·
+[Provenance](#provenance-of-the-frozen-data) ·
+[Threat model](#threat-model)
+
 ## Status
 
 | Step | Status |
 |---|---|
 | Sensor discovery by libfprint (ACPI id `GXFP5187`) | ✅ |
-| Open / close (`FpImageDevice` life cycle) | ✅ |
+| Open / close (`FpDevice` life cycle) | ✅ |
 | SPI dialogue from the driver (firmware version read) | ✅ `GF3288_ST411SEC_APP_11033` |
 | PSK read from the sensor's RAM (0xF2) | ✅ 48 bytes |
 | Hardware GPIO reset (line 58) | ✅ |
 | Config upload (`0x90`, opens the gate) | ✅ |
-| TLS-PSK handshake (mbedtls, sensor=client) | ✅ |
+| TLS-PSK handshake (OpenSSL, sensor=client) | ✅ |
 | Image capture (FDT/REG/nav → image over TLS → 6→4 decoding) | ✅ |
 | Finger detection + background calibration | ✅ (threshold σ>150) |
 | `fp_device_capture` → `FpImage` returned to libfprint | ✅ **sharp fingerprint** |
@@ -391,7 +413,7 @@ deep ones.
 
 Two steps last close to a second each and cannot be split up: establishing the
 session (TLS handshake + background capture) and image capture. Both go through
-mbedTLS's **synchronous** API, which cannot be driven by callbacks without
+OpenSSL's **blocking** API over a synchronous SPI descriptor, which cannot be driven by callbacks without
 restructuring the whole TLS layer.
 
 They therefore run in a worker thread (`GTask`), the result coming back on the
@@ -532,3 +554,11 @@ than on a personal machine:
   not by the sensor. It depends on the threshold and on the adaptive store,
   both described above. A *match-on-chip* sensor would offer a different
   guarantee; this one is not such a sensor.
+
+## License
+
+LGPL-2.1-or-later — see [`COPYING`](COPYING). Each source file carries an
+`SPDX-License-Identifier` header.
+
+Contributions and hardware reports are welcome through the issue tracker. This
+is a community driver for a sensor upstream libfprint does not yet cover.
