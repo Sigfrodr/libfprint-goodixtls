@@ -1,0 +1,24 @@
+# Build
+build/
+__pycache__/
+
+# Test and diagnostic binaries: built from source, never committed.
+# minu-file, test-capture, test-enroll, test-load, test-minutiae and
+# test-verify were tracked as ELF files without their sources; they are
+# ignored here so that cannot happen again.
+minu-file
+test-capture
+test-enroll
+test-load
+test-minutiae
+test-open
+test-sift
+test-verify
+
+# Editor and rescue leftovers
+*.bak
+*.orig
+
+# Compiled catalogues: build artefacts, the .po files are the source
+po/*/LC_MESSAGES/*.mo
+po/*.pot

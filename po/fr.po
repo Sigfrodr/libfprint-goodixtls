@@ -1,0 +1,213 @@
+# French translation for gx-verify (Goodix GXFP5187 driver tool).
+# Copyright (C) 2026 Benjamin Allegre
+# This file is distributed under the same license as the gx-verify package.
+#
+msgid ""
+msgstr ""
+"Project-Id-Version: gx-verify 1.0\n"
+"Report-Msgid-Bugs-To: https://github.com/Sigfrodr/libfprint-goodixtls/issues\n"
+"PO-Revision-Date: 2026-08-23 22:30+0200\n"
+"Last-Translator: Benjamin Allègre (https://github.com/Sigfrodr)\n"
+"Language-Team: French\n"
+"Language: fr\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=2; plural=(n > 1);\n"
+
+#. Zone names: where to place the finger during enrolment.
+msgid "the centre of the pad"
+msgstr "le centre de la pulpe"
+
+msgid "firm touch, finger flat"
+msgstr "pose franche, doigt bien à plat"
+
+msgid "the centre, slightly offset"
+msgstr "le centre, légèrement décalé"
+
+msgid "1 to 2 mm to the side"
+msgstr "1 à 2 mm sur le côté"
+
+msgid "towards the TIP of the finger"
+msgstr "vers la POINTE du doigt"
+
+msgid "roll the finger towards the nail"
+msgstr "roule le doigt vers l'ongle"
+
+msgid "towards the TIP, further"
+msgstr "vers la POINTE, plus loin"
+
+msgid "without lifting the pad"
+msgstr "sans décoller la pulpe"
+
+msgid "towards the BASE of the finger"
+msgstr "vers la BASE du doigt"
+
+msgid "move back towards the first knuckle"
+msgstr "recule vers la première phalange"
+
+msgid "towards the BASE, further"
+msgstr "vers la BASE, plus loin"
+
+msgid "still flat"
+msgstr "toujours à plat"
+
+msgid "the LEFT edge"
+msgstr "le bord GAUCHE"
+
+msgid "tilt the finger slightly to the left"
+msgstr "incline légèrement le doigt à gauche"
+
+msgid "the LEFT edge, further"
+msgstr "le bord GAUCHE, plus loin"
+
+msgid "roll a little more"
+msgstr "roule un peu plus"
+
+msgid "the RIGHT edge"
+msgstr "le bord DROIT"
+
+msgid "tilt the finger slightly to the right"
+msgstr "incline légèrement le doigt à droite"
+
+msgid "the RIGHT edge, further"
+msgstr "le bord DROIT, plus loin"
+
+msgid "TIP + left edge"
+msgstr "POINTE + bord gauche"
+
+msgid "corner of the finger"
+msgstr "coin du doigt"
+
+msgid "TIP + right edge"
+msgstr "POINTE + bord droit"
+
+msgid "BASE + left edge"
+msgstr "BASE + bord gauche"
+
+msgid "BASE + right edge"
+msgstr "BASE + bord droit"
+
+msgid "the centre, to finish"
+msgstr "le centre, pour finir"
+
+msgid "firm touch"
+msgstr "pose franche"
+
+#. Prompts and status.
+msgid "Put your finger down"
+msgstr "Posez votre doigt"
+
+msgid "Verify"
+msgstr "Vérifier"
+
+msgid "Enroll this finger"
+msgstr "Enrôler ce doigt"
+
+msgid "Stop"
+msgstr "Arrêter"
+
+msgid "Reader unavailable"
+msgstr "Lecteur indisponible"
+
+msgid "Ready"
+msgstr "Prêt"
+
+msgid "User: {user}"
+msgstr "Utilisateur : {user}"
+
+msgid "(current)"
+msgstr "(courant)"
+
+msgid "flat, and HOLD IT until the result (the capture takes ~1.5 s)"
+msgstr "bien à plat, et MAINTENEZ-LE jusqu'au résultat (la capture dure ~1,5 s)"
+
+msgid "0 touches"
+msgstr "0 appui"
+
+msgid "Failed to start"
+msgstr "Échec du démarrage"
+
+msgid "Preparing the sensor…"
+msgstr "Préparation du capteur…"
+
+msgid "do not put your finger down yet"
+msgstr "ne posez pas encore le doigt"
+
+msgid "Interrupted"
+msgstr "Interrompu"
+
+msgid "Do not move"
+msgstr "Ne bougez pas"
+
+msgid "reading in progress…"
+msgstr "lecture en cours…"
+
+msgid "You can lift your finger"
+msgstr "Vous pouvez lever le doigt"
+
+msgid "Finger recognised ✓"
+msgstr "Doigt reconnu ✓"
+
+msgid "Finger not recognised"
+msgstr "Doigt non reconnu"
+
+msgid "The sensor is not responding"
+msgstr "Le capteur ne répond pas"
+
+msgid "Session failed — run  sudo gx-recover.sh"
+msgstr "Session impossible — lancer  sudo gx-recover.sh"
+
+msgid "Verification interrupted"
+msgstr "Vérification interrompue"
+
+msgid "Put your finger down again"
+msgstr "Reposez votre doigt"
+
+msgid "Finger removed too early — HOLD IT for two seconds"
+msgstr "Doigt retiré trop tôt — MAINTENEZ-LE deux secondes"
+
+msgid "Finger off-centre"
+msgstr "Doigt mal centré"
+
+msgid "Remove your finger, then put it back"
+msgstr "Retirez le doigt puis reposez-le"
+
+msgid "Imperfect capture — try again"
+msgstr "Capture imparfaite — recommencez"
+
+msgid "{done} / {total} touches"
+msgstr "{done} / {total} appuis"
+
+msgid "Enrollment complete ✓"
+msgstr "Enrôlement terminé ✓"
+
+msgid "Enrollment failed"
+msgstr "Enrôlement échoué"
+
+msgid "Enrollment interrupted"
+msgstr "Enrôlement interrompu"
+
+msgid "{n} matches (attempt {tries})"
+msgstr "{n} correspondances (essai {tries})"
+
+msgid " — view added to the template"
+msgstr " — vue ajoutée au modèle"
+
+msgid "Place {zone}"
+msgstr "Posez {zone}"
+
+msgid " — lift your finger between each touch"
+msgstr " — levez le doigt entre chaque appui"
+
+msgid "Too close to the previous placement"
+msgstr "Trop proche de la pose précédente"
+
+msgid "Try again: place {zone} — {how}"
+msgstr "Recommencez : posez {zone} — {how}"
+
+msgid "Area covered: {ratio:.1f}× one touch — {n} points"
+msgstr "Surface couverte : {ratio:.1f}× un appui — {n} points"
+
+msgid " ({n} touch(es) with no overlap)"
+msgstr " ({n} appui(s) sans recouvrement)"

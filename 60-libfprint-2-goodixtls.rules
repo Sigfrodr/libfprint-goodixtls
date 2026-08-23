@@ -1,0 +1,28 @@
+# Goodix GXFP5187 SPI (TLS-PSK) driver for libfprint
+#
+# Copyright (C) 2026 Benjamin Allègre (https://github.com/Sigfrodr)
+#
+# SPDX-License-Identifier: LGPL-2.1-or-later
+# Goodix GXFP5187 (SPI) — access to the spidev node for libfprint/fprintd
+#
+# libfprint enumerates the "spidev" subsystem and matches the driver by
+# correspondance du chemin sysfs avec l'ACPI id "GXFP5187".
+#
+# 1) Bind the spidev driver to the ACPI SPI device (creates /dev/spidevB.0).
+#    The spidev driver has no ACPI entry for GXFP5187, so the bind is forced
+#    through driver_override when the SPI device is added.
+#
+#    The module must be LOADED first, otherwise /sys/bus/spi/drivers/spidev
+#    does not exist and the bind fails — and it is precisely because spidev has
+#    no alias for this hardware that nothing loads it on its own. It is loaded
+#    through the kmod builtin rather than a modprobe in RUN, which udev advises
+#    against: that can deadlock on the uevents it generates.
+ACTION=="add", SUBSYSTEM=="spi", ENV{MODALIAS}=="acpi:GXFP5187*", \
+    ATTR{driver_override}="spidev", \
+    RUN{builtin}+="kmod load spidev", \
+    RUN+="/bin/sh -c 'echo %k > /sys/bus/spi/drivers/spidev/bind || logger -t goodixtls bind spidev failed for %k'"
+
+# 2) Access to the resulting spidev node (sysfs path containing GXFP5187).
+ACTION=="add|change", SUBSYSTEM=="spidev", \
+    KERNELS=="spi-GXFP5187:00", \
+    TAG+="uaccess", MODE="0660", GROUP="plugdev"
