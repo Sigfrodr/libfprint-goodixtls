@@ -44,6 +44,7 @@ if [ "${1:-}" = "--uninstall" ]; then
   systemctl try-restart fprintd || true
   echo "Done. Enrolled fingerprints are kept; to erase them:"
   echo "  rm -rf /var/lib/fprint/*/goodixtls /var/lib/fprint/.goodixtls-adapt"
+  rm -f /var/lib/fprint/.goodixtls-timing
   exit 0
 fi
 
