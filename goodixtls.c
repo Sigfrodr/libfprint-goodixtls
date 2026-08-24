@@ -78,8 +78,11 @@ struct _FpiDeviceGoodixTls
   guint         poll_id;     /* finger-detection timeout source */
   int           poll_count;  /* poll iterations, bounded to avoid hanging */
   GPtrArray    *enroll_feats;/* descriptor sets accumulated during enrolment */
-  int           fdt_base[12];/* ligne de base FDT (doigt absent) */
+  int           fdt_base[12];/* FDT baseline (finger absent) */
   gboolean      have_fdt;    /* is fdt_base populated? */
+  int           fdt_abs;     /* per-unit absolute floor, derived from baseline */
+  int           timing_scale;/* protocol-delay multiplier in %, grows on desync */
+  int           timing_saved;/* last value persisted to disk, to avoid rewrites */
   gboolean      bg_dirty;    /* background taken with a finger down */
 };
 
@@ -516,7 +519,7 @@ gx_send_capture_sequence (FpiDeviceGoodixTls *self)
         fp_dbg ("chrono cmd=%02x drain=%ld us", body[0],
                  (long) (g_get_monotonic_time () - t0));
       }
-      g_usleep (GX_SEQ_GAP_US);
+      g_usleep (GX_SEQ_GAP_US * self->timing_scale / 100);
     }
 }
 
@@ -650,9 +653,9 @@ gx_fdt_probe (FpiDeviceGoodixTls *self, int *out12)
    * image capture — session setup then failed. The responsiveness gained is
    * not worth it; the polling period already bounds the latency. */
   gx_send_plain_raw (self, fdt, sizeof fdt);
-  g_usleep (15000);
+  g_usleep (15000 * self->timing_scale / 100);
   gx_read_frame (self, &ty, rx, sizeof rx);          /* ACK */
-  g_usleep (8000);
+  g_usleep (8000 * self->timing_scale / 100);
   n = gx_read_frame (self, &ty, rx, sizeof rx);      /* payload */
   if (n < 31)
     return -1;
@@ -750,6 +753,40 @@ gx_read_fw_version (FpiDeviceGoodixTls *self, gchar *out, gsize cap)
 /*  Session: TLS setup, background frame, detection baseline           */
 /* ------------------------------------------------------------------ */
 
+/* Learned protocol-timing multiplier, remembered across opens.
+ *
+ * timing_scale grows within a session when the sensor loses sync (see below),
+ * but resets to nominal on every open — so a consistently slow unit paid one
+ * failed handshake at the start of every session. Persisting the last value
+ * that WORKED skips that: the next open starts at the timing this unit is known
+ * to need. It lives in fprintd's state directory (the only writable path under
+ * ProtectSystem=strict), is device- not user-scoped, and is a single integer.
+ * Delete the file to reset the learned value. */
+#define GX_TIMING_FILE "/var/lib/fprint/.goodixtls-timing"
+
+static int
+gx_timing_load (void)
+{
+  g_autofree gchar *txt = NULL;
+  int v;
+
+  if (!g_file_get_contents (GX_TIMING_FILE, &txt, NULL, NULL))
+    return 100;
+  v = atoi (txt);
+  return (v >= 100 && v <= 300) ? v : 100;   /* clamp; ignore a garbled file */
+}
+
+static void
+gx_timing_save (int scale)
+{
+  g_autofree gchar *txt = g_strdup_printf ("%d\n", scale);
+
+  if (!g_file_set_contents (GX_TIMING_FILE, txt, -1, NULL))
+    fp_warn ("could not persist timing scale to %s", GX_TIMING_FILE);
+  else
+    g_chmod (GX_TIMING_FILE, 0600);
+}
+
 /* Establishes the TLS channel. This is the expensive step, about half a
  * second, and it does not depend on when the finger arrives — so it can be
  * done once and kept. */
@@ -762,9 +799,29 @@ gx_tls_session (FpiDeviceGoodixTls *self)
     return TRUE;
   for (att = 1; att <= 5 && !self->tls_up; att++)
     {
+      GCancellable *c = fpi_device_get_cancellable (FP_DEVICE (self));
+      if (c && g_cancellable_is_cancelled (c))
+        {
+          fp_info ("TLS setup cancelled by the caller");
+          break;
+        }
       if (gx_upload_config_and_reqtls (self) && gx_tls_handshake (self))
         break;
       gx_tls_teardown (self);
+
+      /* Self-healing on desync. The protocol delays are tuned to the author's
+       * unit and sit right at the edge; a different SPI controller can be
+       * slower and lose sync, which shows up here as a failed handshake. Each
+       * failure loosens every scaled delay for the next attempt and for the
+       * rest of this device's lifetime, so a flaky unit converges on timings
+       * that hold instead of failing at the author's values. Capped so a
+       * genuinely dead sensor still gives up rather than crawling. */
+      if (self->timing_scale < 300)
+        {
+          self->timing_scale = MIN (self->timing_scale + 50, 300);
+          fp_info ("handshake failed; loosening protocol timings to %d%%",
+                   self->timing_scale);
+        }
 
       /* A plain reset between attempts. Holding the reset line down for a
        * long time was tried and is actively counter-productive: recovery
@@ -777,6 +834,15 @@ gx_tls_session (FpiDeviceGoodixTls *self)
     fp_warn ("no TLS session after %d attempts; if this persists the sensor "
              "needs a full recovery (long reset plus an spidev rebind)",
              att - 1);
+  else if (self->timing_scale > self->timing_saved)
+    {
+      /* Only ever raise the persisted value, and only on success: a scale
+       * reached while failing (a deep lock-up climbs to the cap and never
+       * connects) must not be written, or every unit would drift to 300%. */
+      gx_timing_save (self->timing_scale);
+      self->timing_saved = self->timing_scale;
+      fp_info ("learned timing scale %d%% persisted", self->timing_scale);
+    }
   return self->tls_up;
 }
 
@@ -830,7 +896,7 @@ gx_session_start (FpiDeviceGoodixTls *self)
          * four discarded captures, which is how the wait before the prompt
          * reached 7 s. Probing first makes those rounds cost 200 ms each. */
         while (!timeout && gx_fdt_probe (self, cur) == 0 &&
-               gx_fdt_mean (cur) < GOODIX_FDT_ABS)
+               gx_fdt_mean (cur) < self->fdt_abs)
           {
             if (waited >= GX_BG_WAIT_MS)
               timeout = TRUE;
@@ -847,7 +913,7 @@ gx_session_start (FpiDeviceGoodixTls *self)
         /* The capture itself lasts about 1.5 s, so a finger can land while it
          * runs and end up baked into the background. Check once more, and
          * redo it if that happened. */
-        if (gx_fdt_probe (self, cur) != 0 || gx_fdt_mean (cur) >= GOODIX_FDT_ABS)
+        if (gx_fdt_probe (self, cur) != 0 || gx_fdt_mean (cur) >= self->fdt_abs)
           break;                                   /* no finger: background good */
         if (timeout)
           {
@@ -873,6 +939,14 @@ gx_session_start (FpiDeviceGoodixTls *self)
       {
         for (k = 0; k < 12; k++) self->fdt_base[k] = acc[k] / nb;
         self->have_fdt = TRUE;
+        /* Derive the absolute floor from THIS unit's idle level instead of a
+         * fixed number. A finger only ever pulls the mean down, so the floor
+         * sits a fixed margin below idle; where idle actually is no longer
+         * matters, which is what makes detection work on a sensor other than
+         * the author's. */
+        self->fdt_abs = gx_fdt_mean (self->fdt_base) - GOODIX_FDT_ABS_MARGIN;
+        fp_info ("FDT auto-calibrated: idle mean=%d -> floor=%d (drop>%d)",
+                 gx_fdt_mean (self->fdt_base), self->fdt_abs, GOODIX_FDT_DROP);
       }
   }
   return self->have_fdt;
@@ -917,7 +991,7 @@ gx_finger_present (FpiDeviceGoodixTls *self)
   if (gx_fdt_probe (self, cur) != 0)
     return FALSE;
   return gx_fdt_drop (self->fdt_base, cur) > GOODIX_FDT_DROP ||
-         gx_fdt_mean (cur) < GOODIX_FDT_ABS;
+         gx_fdt_mean (cur) < self->fdt_abs;
 }
 
 
@@ -1422,7 +1496,7 @@ gx_poll_on (gpointer user_data)
   int cur[12];
 
   if (gx_cancelled (dev, ssm))
-    return G_SOURCE_REMOVE;
+    { self->poll_id = 0; return G_SOURCE_REMOVE; }
 
   if (gx_fdt_probe (self, cur) != 0)
     {
@@ -1434,10 +1508,10 @@ gx_poll_on (gpointer user_data)
   if (t->polls % 5 == 0)
     fp_info ("wait-on: mean=%d drop=%d (thresholds %d / %d)",
              gx_fdt_mean (cur), gx_fdt_drop (self->fdt_base, cur),
-             GOODIX_FDT_ABS, GOODIX_FDT_DROP);
+             self->fdt_abs, GOODIX_FDT_DROP);
 
   if (gx_fdt_drop (self->fdt_base, cur) > GOODIX_FDT_DROP ||
-      gx_fdt_mean (cur) < GOODIX_FDT_ABS)
+      gx_fdt_mean (cur) < self->fdt_abs)
     {
       /* Keep NEEDED asserted: the capture still takes about 1.1 s and the
        * finger must stay down for it. This flag is what lets a user interface
@@ -1445,12 +1519,14 @@ gx_poll_on (gpointer user_data)
        * early, and spoil the capture. */
       fpi_device_report_finger_status (dev, FP_FINGER_STATUS_NEEDED |
                                             FP_FINGER_STATUS_PRESENT);
+      self->poll_id = 0;
       fpi_ssm_jump_to_state (ssm, GX_ST_CAPTURE);
       return G_SOURCE_REMOVE;
     }
 again:
   if (++t->polls > GX_POLL_MAX)
     {
+      self->poll_id = 0;
       fpi_ssm_mark_failed (ssm, fpi_device_retry_new (FP_DEVICE_RETRY_GENERAL));
       return G_SOURCE_REMOVE;
     }
@@ -1468,11 +1544,11 @@ gx_poll_off (gpointer user_data)
   gboolean off = FALSE;
 
   if (gx_cancelled (dev, ssm))
-    return G_SOURCE_REMOVE;
+    { self->poll_id = 0; return G_SOURCE_REMOVE; }
 
   if (gx_fdt_probe (self, cur) == 0 &&
       gx_fdt_drop (self->fdt_base, cur) < GOODIX_FDT_DROP / 2 &&
-      gx_fdt_mean (cur) >= GOODIX_FDT_ABS)
+      gx_fdt_mean (cur) >= self->fdt_abs)
     off = TRUE;
 
   if (off || ++t->polls > GX_POLL_OFF)
@@ -1483,6 +1559,7 @@ gx_poll_off (gpointer user_data)
         fpi_ssm_jump_to_state (ssm, GX_ST_DONE);
       else
         fpi_ssm_jump_to_state (ssm, GX_ST_WAIT_ON);
+      self->poll_id = 0;
       return G_SOURCE_REMOVE;
     }
   return G_SOURCE_CONTINUE;
@@ -1620,12 +1697,13 @@ gx_capture_done (GObject *src, GAsyncResult *res, gpointer user_data)
        * PRESENT without NEEDED is the "you may lift now" signal. */
       fpi_device_report_finger_status (dev, FP_FINGER_STATUS_PRESENT);
       t->polls = 0;
-      g_timeout_add (GX_POLL_MS, gx_poll_off, ssm);
+      self->poll_id = g_timeout_add (GX_POLL_MS, gx_poll_off, ssm);
 }
 
 static void
 gx_run_state (FpiSsm *ssm, FpDevice *dev)
 {
+  FpiDeviceGoodixTls *self = FPI_DEVICE_GOODIXTLS (dev);
   GxTask *t = fpi_ssm_get_data (ssm);
 
   switch (fpi_ssm_get_cur_state (ssm))
@@ -1637,7 +1715,7 @@ gx_run_state (FpiSsm *ssm, FpDevice *dev)
     case GX_ST_WAIT_ON:
       t->polls = 0;
       fpi_device_report_finger_status (dev, FP_FINGER_STATUS_NEEDED);
-      g_timeout_add (GX_POLL_MS, gx_poll_on, ssm);
+      self->poll_id = g_timeout_add (GX_POLL_MS, gx_poll_on, ssm);
       break;                       /* the poll drives the next state */
 
     case GX_ST_CAPTURE:
@@ -1778,6 +1856,14 @@ gx_dev_open (FpDevice *dev)
     ioctl (self->spi_fd, SPI_IOC_WR_BITS_PER_WORD, &bits);
     ioctl (self->spi_fd, SPI_IOC_WR_MAX_SPEED_HZ, &speed);
   }
+  /* Fallbacks until the first calibration measures the unit: fdt_abs is the
+   * hard-coded floor, timing_scale is nominal. Both then adapt per unit. */
+  self->fdt_abs = GOODIX_FDT_ABS;
+  self->timing_scale = gx_timing_load ();
+  self->timing_saved = self->timing_scale;
+  if (self->timing_scale != 100)
+    fp_info ("starting from learned timing scale %d%%", self->timing_scale);
+
   gx_gpio_reset (self);
 
   if (gx_read_fw_version (self, fw, sizeof fw))
@@ -1793,6 +1879,9 @@ gx_dev_close (FpDevice *dev)
 {
   FpiDeviceGoodixTls *self = FPI_DEVICE_GOODIXTLS (dev);
 
+  /* Cancel a pending finger-detection poll before tearing state down: it holds
+   * the SSM as user data and would fire on freed state otherwise. */
+  g_clear_handle_id (&self->poll_id, g_source_remove);
   gx_tls_teardown (self);
   if (self->spi_fd >= 0)
     {

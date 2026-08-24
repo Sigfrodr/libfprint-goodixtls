@@ -82,9 +82,22 @@
 /* Absolute threshold on the mean of those twelve values. Needed because the
  * relative threshold above is useless when the baseline itself was taken with
  * a finger resting on the sensor — exactly when detection would otherwise fail
- * silently. Placed between the measured populations (363 idle, 266-314 with a
- * finger) rather than at their boundary. */
+ * silently.
+ *
+ * This is NOT used as a fixed number at runtime: it is the fallback the driver
+ * starts from, then recomputes per unit as (measured idle mean − margin) once
+ * it has a baseline. On the author's sensor idle sits near 364, so the derived
+ * floor lands near 340 — the value this used to be hard-coded to. On another
+ * unit whose idle sits elsewhere, a fixed 340 was the portability bug behind
+ * the "huge amount of failed attempts" report: a sensor idling below it reads
+ * as a finger on every poll and captures noise. See self->fdt_abs. */
 #define GOODIX_FDT_ABS  340
+
+/* How far below the measured idle mean the per-unit absolute floor sits.
+ * Chosen so idle≈364 − margin reproduces the previous 340 on the author's
+ * unit; it is the gap between the idle population and the weakest finger
+ * press, kept roughly centred between the two. */
+#define GOODIX_FDT_ABS_MARGIN 24
 
 /* Frame checksum. */
 static inline guint8
