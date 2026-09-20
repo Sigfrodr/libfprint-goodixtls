@@ -1,8 +1,9 @@
-# libfprint-goodixtls — TOD driver for the Goodix GXFP5187 (SPI)
+# libfprint-goodixtls — TOD driver for the Goodix GXFP5187 / GXFP51A7 (SPI)
 
 [libfprint](https://fprint.freedesktop.org/) driver (**TOD** variant, the one
-Ubuntu ships) for the **Goodix GXFP5187** SPI fingerprint sensor of the Huawei
-MateBook X Pro (`MACH-WX9`), unsupported upstream (libfprint issue #112).
+Ubuntu ships) for the **Goodix GXFP5187** and **GXFP51A7** SPI fingerprint
+sensors of the Huawei MateBook X Pro (`MACH-WX9`) and MateBook 13 2019
+(`WRT-WX9`), unsupported upstream (libfprint issue #112).
 
 The protocol has been fully reverse-engineered. The TLS-PSK channel is
 established **without** Intel ME / SGX / IAP: the PSK is read out of the
@@ -17,8 +18,10 @@ sensor's RAM through the `0xF2` memory command.
 
 ## At a glance
 
-- **Hardware** — Goodix **GXFP5187** SPI sensor (ACPI id `GXFP5187`), as found in
-  the Huawei MateBook X Pro (`MACH-WX9`); firmware `GF3288_ST411SEC_APP_11033`.
+- **Hardware** — Goodix **GXFP5187** (MateBook X Pro `MACH-WX9`, firmware
+  `GF3288_ST411SEC_APP_11033`) and Goodix **GXFP51A7** (MateBook 13 2019
+  `WRT-WX9`, MilanL chip `0x2205`, firmware `GF3288_ST411SEC_APP_14003`); both
+  SPI, TLS-PSK, 132×112.
 - **What works** — enrolment and verification through `fprintd` and GNOME
   Settings; session unlock and `sudo`. Open matcher, no NBIS, no Intel ME/SGX.
 - **Install** — `sudo ./install.sh` does everything (dependencies, build,
@@ -26,6 +29,18 @@ sensor's RAM through the `0xF2` memory command.
   [spidev prerequisite](#runtime-prerequisite-spidev-node) for the manual steps.
 - **Enrol / verify with on-screen guidance** — `python3 gx-verify.py`, see
   [gx-verify.py](#testing-with-visible-feedback-gx-verifypy).
+
+### Supported models
+
+| ACPI id | Laptop | Backend / firmware | Reset | PSK address |
+|---|---|---|---|---|
+| `GXFP5187` | MateBook X Pro (`MACH-WX9`) | `GF3288_ST411SEC_APP_11033` | gpiochip0 line 58, active-low | `0x20007f0c` |
+| `GXFP51A7` | MateBook 13 2019 (`WRT-WX9`) | MilanL `0x2205`, `GF3288_ST411SEC_APP_14003` | gpiochip0 line 264, active-high | `0x20007f14` |
+
+The backend, reset line and PSK address are selected automatically from the ACPI
+id. The reset line / polarity and PSK address can be overridden with
+`GOODIXTLS_RESET_LINE`, `GOODIXTLS_RESET_ACTIVE_HIGH` and `GOODIXTLS_PSK_ADDR`,
+and `GOODIXTLS_WRITE_GAP_US` (default `2000`) tunes the split-write gap.
 
 **Contents** —
 [Why a dedicated matcher](#why-a-dedicated-matcher-and-not-nbis) ·
@@ -41,7 +56,7 @@ sensor's RAM through the `0xF2` memory command.
 
 | Step | Status |
 |---|---|
-| Sensor discovery by libfprint (ACPI id `GXFP5187`) | ✅ |
+| Sensor discovery by libfprint (ACPI id `GXFP5187` / `GXFP51A7`) | ✅ |
 | Open / close (`FpDevice` life cycle) | ✅ |
 | SPI dialogue from the driver (firmware version read) | ✅ `GF3288_ST411SEC_APP_11033` |
 | PSK read from the sensor's RAM (0xF2) | ✅ 48 bytes |
@@ -225,9 +240,17 @@ glaring as soon as another person tries.
 ## Usage
 
 Once installed, the sensor appears in **GNOME Settings → Users → Fingerprint
-Login**. Enrolment asks for **5 presses** (the driver captures 3 views per
-press, i.e. 15 views in total: the finger shifts slightly from one capture to
+Login**. Enrolment asks for **15 presses** (the driver captures 2 views per
+press, i.e. 30 views in total: the finger shifts slightly from one capture to
 the next, which enriches the template without multiplying the gestures).
+
+> **Upgrading from an earlier build? Re-enrol.** A template is only valid for
+> the image alignment it was captured with. This driver changed the FDT base
+> formula for MilanL (GXFP51A7), so a template enrolled with a previous build
+> stops matching however rich it is: measured on one unit, a 28-view pre-change
+> template scored **7** where a fresh 26-view enrolment of the same finger
+> scored **78** (threshold 15). If verification gets worse after an update,
+> delete and re-enrol before suspecting the driver.
 
 **A re-enrolment REPLACES the template, it does not enrich it.** The driver
 declares `FP_DEVICE_FEATURE_UPDATE_PRINT` and knows how to take over the views
@@ -449,6 +472,79 @@ meson setup build
 ninja -C build
 sudo ninja -C build install     # -> /usr/lib/x86_64-linux-gnu/libfprint-2/tod-1/
 ```
+
+### Arch Linux / Omarchy
+
+`install.sh` targets Debian/Ubuntu (`apt`, `dpkg`, `/usr/libexec/fprintd`). On
+Arch the same pieces are installed by hand, and the TOD prerequisite is the one
+real difference: Arch's stock `libfprint` package ships the public API only — no
+`libfprint-2-tod-dev`, no `libfprint-2-tod-1.pc`, no exported `fpi_*` symbols —
+so there is nothing for the driver to build against. Either install the
+`libfprint-tod` AUR package (it provides `libfprint` and conflicts with the
+stock package), or build the TOD fork:
+
+```bash
+git clone --branch v1.94.10+tod1 https://gitlab.freedesktop.org/3v1n0/libfprint.git
+cd libfprint
+meson setup build -Dprefix=/usr -Ddrivers=default -Dintrospection=false \
+  -Dinstalled-tests=false -Ddoc=false -Dgtk-examples=false
+ninja -C build
+sudo meson install -C build     # -Dprefix=/usr is mandatory: meson's default
+                                # /usr/local is not where fprintd loads from
+```
+
+Then the driver itself, with `-Dsysconfdir=/etc` so the modprobe drop-in lands
+where `modprobe` reads it (the default `/usr/local/etc` is ignored):
+
+```bash
+sudo pacman -S --needed meson ninja glib2-devel libfprint fprintd
+meson setup build -Dprefix=/usr -Dsysconfdir=/etc
+ninja -C build
+sudo ninja -C build install
+```
+
+The system wiring `meson install` leaves to you:
+
+```bash
+# spidev has no ACPI alias for this hardware, so nothing loads it on its own;
+# without it /sys/bus/spi/drivers/spidev does not exist and the udev rule's
+# bind fails silently.
+echo spidev | sudo tee /etc/modules-load.d/goodixtls-spidev.conf
+sudo modprobe -r spidev 2>/dev/null || true
+sudo modprobe spidev bufsiz=65536      # the sensor sends ~22 kB image frames
+
+# fprintd: the driver opens /dev/gpiochip0 for the reset line and writes under
+# /run/goodixtls/, both refused by the unit's DeviceAllow= / ProtectSystem=strict
+# without this drop-in. Arch's daemon binary is /usr/lib/fprintd
+# (Ubuntu uses /usr/libexec/fprintd).
+sudo mkdir -p /etc/systemd/system/fprintd.service.d
+sudo tee /etc/systemd/system/fprintd.service.d/goodixtls.conf >/dev/null <<'EOF'
+[Service]
+ExecStart=
+ExecStart=/usr/lib/fprintd --no-timeout
+DeviceAllow=/dev/gpiochip0 rw
+RuntimeDirectory=goodixtls
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+EOF
+sudo systemctl daemon-reload
+
+sudo udevadm control --reload
+sudo udevadm trigger --subsystem-match=spidev --subsystem-match=spi
+sudo systemctl restart fprintd         # libfprint enumerates only at startup
+```
+
+There is no `pam-auth-update` on Arch. Add the module to the stacks you want by
+hand; the password stays available as a fallback:
+
+```bash
+sudo sed -i '1i auth      sufficient pam_fprintd.so' /etc/pam.d/sudo
+sudo sed -i '1i auth      sufficient pam_fprintd.so' /etc/pam.d/polkit-1
+```
+
+On an Omarchy install, do **not** run `omarchy setup security fingerprint`: it
+installs the `libfprint-git` AUR package, which replaces the TOD build this
+driver needs. Apply the PAM edits above instead.
 
 ## Runtime prerequisite: spidev node
 

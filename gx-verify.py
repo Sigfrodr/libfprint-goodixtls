@@ -128,6 +128,13 @@ class Coverage(Gtk.DrawingArea):
 
 
 class App(Gtk.Application):
+    # Repeated on every abort path: fprintd unlinks the old template at
+    # EnrollStart, so a stopped enrolment is not "not saved", it is "deleted".
+    ENROLL_REPLACES_WARNING = (
+        _("fprintd deletes the fingerprint already stored for this finger the "
+          "moment a new enrolment starts. If you stop before all the touches "
+          "are done, you are left with NO fingerprint at all."))
+
     def __init__(self):
         super().__init__(application_id="org.goodixtls.verify")
         self.dev = None
@@ -192,7 +199,7 @@ class App(Gtk.Application):
 
         self.b_enroll = Gtk.Button(label=_("Enroll this finger"))
         self.b_enroll.add_css_class("pill")
-        self.b_enroll.connect("clicked", lambda _b: self.start("enroll"))
+        self.b_enroll.connect("clicked", lambda _b: self.confirm_enroll())
         btns.append(self.b_enroll)
 
         self.b_stop = Gtk.Button(label=_("Stop"))
@@ -201,13 +208,73 @@ class App(Gtk.Application):
         self.b_stop.set_visible(False)
         btns.append(self.b_stop)
 
+        self.win.connect("close-request", self.on_close_request)
         self.set_buttons(False)
         self.win.present()
         self.connect_device()
 
+    def on_close_request(self, *_args):
+        if self.mode == "enroll":
+            self.stop()            # confirmation, and keep the window open
+            return True
+        return False
+
     def set_buttons(self, ready):
         self.b_verify.set_sensitive(ready)
         self.b_enroll.set_sensitive(ready)
+
+    def refresh_enroll_label(self):
+        """Say out loud that the button is destructive once a print exists."""
+        try:
+            enrolled = self.dev.call_sync(
+                "ListEnrolledFingers", GLib.Variant("(s)", (USER,)),
+                Gio.DBusCallFlags.NONE, -1, None).unpack()[0]
+        except Exception:
+            enrolled = []
+        self.b_enroll.set_label(
+            _("Re-enrol (deletes the current one)") if FINGER in enrolled
+            else _("Enroll this finger"))
+
+    # --- enrolment safety -------------------------------------------
+    def confirm_enroll(self):
+        """Warn before replacing: fprintd deletes the stored print at EnrollStart.
+
+        It is not the driver and not this tool that erases: fprintd itself
+        unlinks the existing template for the finger as soon as a new enrolment
+        begins. Stopping halfway therefore leaves NO fingerprint at all, which
+        looks exactly like "the enrolment was never saved" -- but a completed
+        enrolment is saved (enroll_cb: result enroll-completed, print saved to
+        /var/lib/fprint/<user>/<driver>/0/<finger>).
+        """
+        if not self.dev:
+            return
+        try:
+            enrolled = self.dev.call_sync(
+                "ListEnrolledFingers", GLib.Variant("(s)", (USER,)),
+                Gio.DBusCallFlags.NONE, -1, None).unpack()[0]
+        except Exception:
+            enrolled = []          # NoEnrolledPrints -> nothing to replace
+        if FINGER not in enrolled:
+            return self.start("enroll")
+        dlg = Gtk.AlertDialog()
+        dlg.set_message(_("Delete the current fingerprint and re-enrol?"))
+        dlg.set_detail(self.ENROLL_REPLACES_WARNING + " " +
+                       _("Your fingerprint already works — you do NOT need to "
+                         "re-enrol unless you want to cover more of the finger. "
+                         "Cancel is the safe choice; use Verify to check it."))
+        dlg.set_buttons([_("Cancel (keep it)"),
+                         _("Delete it and start over")])
+        dlg.set_cancel_button(0)
+        dlg.set_default_button(0)
+        dlg.choose(self.win, None, self.on_enroll_choice)
+
+    def on_enroll_choice(self, dlg, result):
+        try:
+            choice = dlg.choose_finish(result)
+        except GLib.Error:
+            return                 # dismissed
+        if choice == 1:
+            self.start("enroll")
 
     # --- connection ---------------------------------------------------
     def connect_device(self):
@@ -230,6 +297,7 @@ class App(Gtk.Application):
         self.state("idle", _("Ready"),
                    _("User: {user}").format(user=USER or _("(current)")))
         self.set_buttons(True)
+        self.refresh_enroll_label()
 
     # --- claiming -------------------------------------------------
     def ensure_claimed(self):
@@ -287,7 +355,11 @@ class App(Gtk.Application):
             # screen would stay on "Preparing". So we re-read the state once.
             GLib.timeout_add(300, self.sync_prompt)
         except Exception as e:
-            self.finish("error", _("Failed to start"), str(e))
+            if "NoEnrolledPrints" in str(e):
+                self.finish("error", _("No fingerprint enrolled"),
+                            _("Enrol one first with \"Enroll this finger\"."))
+            else:
+                self.finish("error", _("Failed to start"), str(e))
 
     def sync_prompt(self):
         """Re-read finger-needed/present and bring the screen back in sync."""
@@ -316,7 +388,28 @@ class App(Gtk.Application):
                    _("do not put your finger down yet"))
 
     def stop(self):
+        if self.mode == "enroll":
+            dlg = Gtk.AlertDialog()
+            dlg.set_message(_("Stop the enrolment?"))
+            dlg.set_detail(self.ENROLL_REPLACES_WARNING + " " +
+                           _("Your old fingerprint was deleted the moment this "
+                             "enrolment started. Stopping now leaves you with "
+                             "nothing enrolled."))
+            dlg.set_buttons([_("Keep going"), _("Stop anyway")])
+            dlg.set_cancel_button(0)
+            dlg.set_default_button(0)
+            dlg.choose(self.win, None, self.on_stop_choice)
+            return
         self.finish("idle", _("Interrupted"), "")
+
+    def on_stop_choice(self, dlg, result):
+        try:
+            choice = dlg.choose_finish(result)
+        except GLib.Error:
+            return                 # dismissed -> carry on enrolling
+        if choice == 1:
+            self.finish("nomatch", _("Enrolment interrupted"),
+                        self.ENROLL_REPLACES_WARNING)
 
     def finish(self, kind, message, detail):
         for m in ("VerifyStop", "EnrollStop"):
@@ -324,6 +417,15 @@ class App(Gtk.Application):
                 self.dev.call_sync(m, None, Gio.DBusCallFlags.NONE, -1, None)
             except Exception:
                 pass
+        # Hand the sensor back at the end of every operation. fprintd lets only
+        # ONE client claim a device, so leaving it claimed here blocks
+        # fprintd-verify / the lock screen / sudo with "Device was already
+        # claimed" for as long as this window is open. ensure_claimed() takes it
+        # back before the next operation.
+        try:
+            self.dev.call_sync("Release", None, Gio.DBusCallFlags.NONE, -1, None)
+        except Exception:
+            pass
         self.mode = None
         self.b_stop.set_visible(False)
         self.set_buttons(True)
@@ -387,10 +489,15 @@ class App(Gtk.Application):
             self.bar.set_text(_("{done} / {total} touches").format(
                 done=self.stages, total=self.nstages))
             self.bar.set_fraction(1.0)
+            self.refresh_enroll_label()
             return self.finish("match", _("Enrollment complete ✓"),
-                               self.coverage_text())
+                               self.coverage_text() + "\n" +
+                               _("Saved. Now run Verify a few times: presses "
+                                 "scoring 30+ add their view to the template "
+                                 "and make recognition more reliable."))
         if result == "enroll-failed":
-            return self.finish("error", _("Enrollment failed"), "")
+            return self.finish("error", _("Enrollment failed"),
+                               self.ENROLL_REPLACES_WARNING)
         if result == "enroll-stage-passed":
             self.read_coverage()
             self.bar.set_text(f"{self.stages} / {self.nstages} touches")

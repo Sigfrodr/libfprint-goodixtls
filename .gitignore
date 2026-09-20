@@ -12,6 +12,7 @@ test-enroll
 test-load
 test-minutiae
 test-open
+test-session
 test-sift
 test-verify
 

@@ -20,7 +20,12 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-SPI_DEV=spi-GXFP5187:00
+# The same driver serves two ACPI ids; pick whichever is present.
+SPI_DEV=
+for d in spi-GXFP51A7:00 spi-GXFP5187:00; do
+  [ -d "/sys/bus/spi/devices/$d" ] && { SPI_DEV=$d; break; }
+done
+SPI_DEV=${SPI_DEV:-spi-GXFP5187:00}
 DROPIN=/etc/systemd/system/fprintd.service.d/goodixtls.conf
 
 say()  { printf '\n\033[1m== %s\033[0m\n' "$*"; }
@@ -124,8 +129,8 @@ systemctl daemon-reload
 # --- 4. binding the spidev node ---------------------------------------
 say "Binding the sensor to spidev"
 if [ ! -d "/sys/bus/spi/devices/$SPI_DEV" ]; then
-  warn "Sensor $SPI_DEV not present on the SPI bus."
-  warn "Check the hardware really is a GXFP5187 (ACPI path \\_SB_.SPBA)."
+  warn "No supported sensor present on the SPI bus (looked for GXFP51A7, GXFP5187)."
+  warn "Check the hardware really is a Goodix GXFP51A7 or GXFP5187 (ACPI path \\_SB_.SPBA)."
 else
   echo spidev > "/sys/bus/spi/devices/$SPI_DEV/driver_override"
   # Do not swallow the error: a failed bind shows up nowhere else, and fprintd
@@ -136,7 +141,8 @@ else
     warn "Cannot bind $SPI_DEV to spidev: $(cat /tmp/gx-bind.err)"
   fi
   rm -f /tmp/gx-bind.err
-  [ -e /dev/spidev0.0 ] && echo "Node /dev/spidev0.0 ready." || warn "spidev node missing."
+  node=$(ls /dev/spidev* 2>/dev/null | head -1)
+  [ -n "$node" ] && echo "Node $node ready." || warn "spidev node missing."
 fi
 
 systemctl restart fprintd
