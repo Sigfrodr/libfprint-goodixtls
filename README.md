@@ -240,9 +240,17 @@ glaring as soon as another person tries.
 ## Usage
 
 Once installed, the sensor appears in **GNOME Settings → Users → Fingerprint
-Login**. Enrolment asks for **5 presses** (the driver captures 3 views per
-press, i.e. 15 views in total: the finger shifts slightly from one capture to
+Login**. Enrolment asks for **15 presses** (the driver captures 2 views per
+press, i.e. 30 views in total: the finger shifts slightly from one capture to
 the next, which enriches the template without multiplying the gestures).
+
+> **Upgrading from an earlier build? Re-enrol.** A template is only valid for
+> the image alignment it was captured with. This driver changed the FDT base
+> formula for MilanL (GXFP51A7), so a template enrolled with a previous build
+> stops matching however rich it is: measured on one unit, a 28-view pre-change
+> template scored **7** where a fresh 26-view enrolment of the same finger
+> scored **78** (threshold 15). If verification gets worse after an update,
+> delete and re-enrol before suspecting the driver.
 
 **A re-enrolment REPLACES the template, it does not enrich it.** The driver
 declares `FP_DEVICE_FEATURE_UPDATE_PRINT` and knows how to take over the views
