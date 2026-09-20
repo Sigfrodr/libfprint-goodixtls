@@ -1,8 +1,9 @@
-# libfprint-goodixtls — TOD driver for the Goodix GXFP5187 (SPI)
+# libfprint-goodixtls — TOD driver for the Goodix GXFP5187 / GXFP51A7 (SPI)
 
 [libfprint](https://fprint.freedesktop.org/) driver (**TOD** variant, the one
-Ubuntu ships) for the **Goodix GXFP5187** SPI fingerprint sensor of the Huawei
-MateBook X Pro (`MACH-WX9`), unsupported upstream (libfprint issue #112).
+Ubuntu ships) for the **Goodix GXFP5187** and **GXFP51A7** SPI fingerprint
+sensors of the Huawei MateBook X Pro (`MACH-WX9`) and MateBook 13 2019
+(`WRT-WX9`), unsupported upstream (libfprint issue #112).
 
 The protocol has been fully reverse-engineered. The TLS-PSK channel is
 established **without** Intel ME / SGX / IAP: the PSK is read out of the
@@ -17,8 +18,10 @@ sensor's RAM through the `0xF2` memory command.
 
 ## At a glance
 
-- **Hardware** — Goodix **GXFP5187** SPI sensor (ACPI id `GXFP5187`), as found in
-  the Huawei MateBook X Pro (`MACH-WX9`); firmware `GF3288_ST411SEC_APP_11033`.
+- **Hardware** — Goodix **GXFP5187** (MateBook X Pro `MACH-WX9`, firmware
+  `GF3288_ST411SEC_APP_11033`) and Goodix **GXFP51A7** (MateBook 13 2019
+  `WRT-WX9`, MilanL chip `0x2205`, firmware `GF3288_ST411SEC_APP_14003`); both
+  SPI, TLS-PSK, 132×112.
 - **What works** — enrolment and verification through `fprintd` and GNOME
   Settings; session unlock and `sudo`. Open matcher, no NBIS, no Intel ME/SGX.
 - **Install** — `sudo ./install.sh` does everything (dependencies, build,
@@ -26,6 +29,18 @@ sensor's RAM through the `0xF2` memory command.
   [spidev prerequisite](#runtime-prerequisite-spidev-node) for the manual steps.
 - **Enrol / verify with on-screen guidance** — `python3 gx-verify.py`, see
   [gx-verify.py](#testing-with-visible-feedback-gx-verifypy).
+
+### Supported models
+
+| ACPI id | Laptop | Backend / firmware | Reset | PSK address |
+|---|---|---|---|---|
+| `GXFP5187` | MateBook X Pro (`MACH-WX9`) | `GF3288_ST411SEC_APP_11033` | gpiochip0 line 58, active-low | `0x20007f0c` |
+| `GXFP51A7` | MateBook 13 2019 (`WRT-WX9`) | MilanL `0x2205`, `GF3288_ST411SEC_APP_14003` | gpiochip0 line 264, active-high | `0x20007f14` |
+
+The backend, reset line and PSK address are selected automatically from the ACPI
+id. The reset line / polarity and PSK address can be overridden with
+`GOODIXTLS_RESET_LINE`, `GOODIXTLS_RESET_ACTIVE_HIGH` and `GOODIXTLS_PSK_ADDR`,
+and `GOODIXTLS_WRITE_GAP_US` (default `2000`) tunes the split-write gap.
 
 **Contents** —
 [Why a dedicated matcher](#why-a-dedicated-matcher-and-not-nbis) ·
@@ -41,7 +56,7 @@ sensor's RAM through the `0xF2` memory command.
 
 | Step | Status |
 |---|---|
-| Sensor discovery by libfprint (ACPI id `GXFP5187`) | ✅ |
+| Sensor discovery by libfprint (ACPI id `GXFP5187` / `GXFP51A7`) | ✅ |
 | Open / close (`FpDevice` life cycle) | ✅ |
 | SPI dialogue from the driver (firmware version read) | ✅ `GF3288_ST411SEC_APP_11033` |
 | PSK read from the sensor's RAM (0xF2) | ✅ 48 bytes |

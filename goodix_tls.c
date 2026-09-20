@@ -251,7 +251,15 @@ gx_tls_handshake_run (GxTls *t, GError **error)
                    "PSK-AES128-CBC-SHA256 unavailable in this OpenSSL build");
       return FALSE;
     }
+  /* No session tickets: OpenSSL would send a NewSessionTicket after the
+   * handshake, and the MCU's record accounting may not expect it (tested as a
+   * possible cause of the 0xD0 "reconnect" abort). */
+  SSL_CTX_set_options (t->ctx, SSL_OP_NO_TICKET);
   SSL_CTX_set_psk_server_callback (t->ctx, psk_server_cb);
+  /* The identity hint makes OpenSSL emit a ServerKeyExchange record. The
+   * ChicagoHS sibling does without it, but the MilanL MCU needs it to OPEN
+   * its command gate (state 0x04): without it the gate stays closed (0x0c)
+   * and every cmd0<=5 command is dropped. Keep it. */
   if (t->identity)
     SSL_CTX_use_psk_identity_hint (t->ctx, t->identity);
 
@@ -320,15 +328,28 @@ gx_tls_decrypt_record (GxTls *t, const guint8 *raw, gsize raw_len,
   gsize content_len, pad;
 
   if (!t || !t->keys_ready || raw_len < 5 + IV_LEN + MAC_LEN)
-    return -1;
+    {
+      g_warning ("decrypt: input too short (raw_len=%" G_GSIZE_FORMAT ")", raw_len);
+      return -1;
+    }
   if (raw[0] != 23)                         /* application data */
-    return -1;
+    {
+      g_warning ("decrypt: type %02x is not application data (raw_len=%" G_GSIZE_FORMAT
+                 ", hdr %02x %02x %02x %02x %02x)",
+                 raw[0], raw_len, raw[0], raw[1], raw[2], raw[3], raw[4]);
+      return -1;
+    }
 
   body = raw + 5;
   body_len = ((gsize) raw[3] << 8) | raw[4];
   if (body_len + 5 > raw_len || body_len < IV_LEN + MAC_LEN ||
       (body_len - IV_LEN) % IV_LEN != 0)
-    return -1;
+    {
+      g_warning ("decrypt: framing mismatch: body_len=%" G_GSIZE_FORMAT
+                 " raw_len=%" G_GSIZE_FORMAT " (spi frame carried %s)",
+                 body_len, raw_len, body_len + 5 == raw_len ? "one full record" : "a TRUNCATED record");
+      return -1;
+    }
 
   /* AES-128-CBC, explicit IV in front of the ciphertext (TLS 1.2). */
   plain = g_malloc (body_len);
@@ -359,29 +380,51 @@ gx_tls_decrypt_record (GxTls *t, const guint8 *raw, gsize raw_len,
 
   /* MAC covers seq_num || type || version || length || content. Verifying it
    * also confirms the sequence number is in step; a mismatch here is the loud
-   * failure that would otherwise show up as silently corrupt images. */
-  for (int i = 0; i < 8; i++)
-    hdr[i] = (guint8) (t->read_seq >> (56 - 8 * i));
+   * failure that would otherwise show up as silently corrupt images.
+   *
+   * The expected sequence number is tried first, then a bounded window forward.
+   * read_seq only advances on success and there is no rekey path, so a single
+   * lost record would otherwise desync the stream for the rest of the session --
+   * every subsequent capture would fail with an identical MAC error. Accepting a
+   * forward match stays MAC-verified: it cannot admit a forged record, only
+   * recover from a dropped one. It is also the diagnostic that separates our two
+   * candidate causes: a resync means records were LOST (the single-slot stash in
+   * gx_send_plain_drain is dropping them); no match anywhere in the window means
+   * the bytes were CORRUPTED in transit (the read path). */
   hdr[8] = raw[0];
   hdr[9] = raw[1];
   hdr[10] = raw[2];
   hdr[11] = (guint8) (content_len >> 8);
   hdr[12] = (guint8) content_len;
 
-  {
-    g_autofree guint8 *msg = g_malloc (sizeof hdr + content_len);
+  for (guint64 s = t->read_seq; s <= t->read_seq + 32; s++)
+    {
+      g_autofree guint8 *msg = g_malloc (sizeof hdr + content_len);
 
-    memcpy (msg, hdr, sizeof hdr);
-    memcpy (msg + sizeof hdr, plain, content_len);
-    HMAC (EVP_sha256 (), t->client_mac, MAC_KEY_LEN, msg,
-          sizeof hdr + content_len, want, &want_len);
-  }
-  if (want_len != MAC_LEN || CRYPTO_memcmp (want, mac, MAC_LEN) != 0)
-    return -1;
+      for (int i = 0; i < 8; i++)
+        hdr[i] = (guint8) (s >> (56 - 8 * i));
+      memcpy (msg, hdr, sizeof hdr);
+      memcpy (msg + sizeof hdr, plain, content_len);
+      HMAC (EVP_sha256 (), t->client_mac, MAC_KEY_LEN, msg,
+            sizeof hdr + content_len, want, &want_len);
 
-  memcpy (out, plain, content_len);
-  t->read_seq++;
-  return (gssize) content_len;
+      if (want_len == MAC_LEN && CRYPTO_memcmp (want, mac, MAC_LEN) == 0)
+        {
+          if (s != t->read_seq)
+            g_warning ("decrypt: read_seq resynced %" G_GUINT64_FORMAT
+                       " -> %" G_GUINT64_FORMAT " (%" G_GUINT64_FORMAT
+                       " TLS record(s) LOST before the image)",
+                       t->read_seq, s, s - t->read_seq);
+          t->read_seq = s + 1;
+          memcpy (out, plain, content_len);
+          return (gssize) content_len;
+        }
+    }
+
+  g_warning ("decrypt: no sequence in read_seq..+32 matched (read_seq=%" G_GUINT64_FORMAT
+             ", content_len=%" G_GSIZE_FORMAT ") -> bytes CORRUPT in transit",
+             t->read_seq, content_len);
+  return -1;
 }
 
 void

@@ -1,5 +1,5 @@
 /*
- * Goodix GXFP5187 SPI (TLS-PSK) driver for libfprint
+ * Goodix GXFP5187 / GXFP51A7 SPI (TLS-PSK) driver for libfprint
  *
  * Copyright (C) 2026 Benjamin Allègre (https://github.com/Sigfrodr)
  *
@@ -62,6 +62,21 @@
  * client and the host is the server.
  */
 #define GOODIX_PSK_ADDR   0x20007f0c
+/*
+ * The PSK address MOVES between firmware revisions of the same GF3288
+ * generation:
+ *
+ *   0x20007f0c   GF3288_ST411SEC_APP_11033   GXFP5187 (MateBook X Pro)
+ *   0x20007f14   GF3288_ST411SEC_APP_14003   GXFP51A7 (MateBook 13 2019)
+ *
+ * Reading the wrong one does NOT fail loudly. It returns eight zero bytes
+ * followed by the first forty bytes of the key, the read still reports full
+ * length, and the only symptom is a TLS handshake that dies with
+ * "cipher operation failed". Measured on a GXFP51A7 by reading a 128-byte
+ * window at 0x20007f00 with the 0xF2 memory command: the key is a clean
+ * 48-byte high-entropy block starting at +0x14, with zeros on either side.
+ * Resolved per device by gx_psk_addr_for_device(). */
+#define GOODIX_PSK_ADDR_GXFP51A7 0x20007f14
 #define GOODIX_PSK_LEN    48
 #define GOODIX_TLS_IDENTITY "Client_identity"
 
