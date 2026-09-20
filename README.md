@@ -473,6 +473,79 @@ ninja -C build
 sudo ninja -C build install     # -> /usr/lib/x86_64-linux-gnu/libfprint-2/tod-1/
 ```
 
+### Arch Linux / Omarchy
+
+`install.sh` targets Debian/Ubuntu (`apt`, `dpkg`, `/usr/libexec/fprintd`). On
+Arch the same pieces are installed by hand, and the TOD prerequisite is the one
+real difference: Arch's stock `libfprint` package ships the public API only — no
+`libfprint-2-tod-dev`, no `libfprint-2-tod-1.pc`, no exported `fpi_*` symbols —
+so there is nothing for the driver to build against. Either install the
+`libfprint-tod` AUR package (it provides `libfprint` and conflicts with the
+stock package), or build the TOD fork:
+
+```bash
+git clone --branch v1.94.10+tod1 https://gitlab.freedesktop.org/3v1n0/libfprint.git
+cd libfprint
+meson setup build -Dprefix=/usr -Ddrivers=default -Dintrospection=false \
+  -Dinstalled-tests=false -Ddoc=false -Dgtk-examples=false
+ninja -C build
+sudo meson install -C build     # -Dprefix=/usr is mandatory: meson's default
+                                # /usr/local is not where fprintd loads from
+```
+
+Then the driver itself, with `-Dsysconfdir=/etc` so the modprobe drop-in lands
+where `modprobe` reads it (the default `/usr/local/etc` is ignored):
+
+```bash
+sudo pacman -S --needed meson ninja glib2-devel libfprint fprintd
+meson setup build -Dprefix=/usr -Dsysconfdir=/etc
+ninja -C build
+sudo ninja -C build install
+```
+
+The system wiring `meson install` leaves to you:
+
+```bash
+# spidev has no ACPI alias for this hardware, so nothing loads it on its own;
+# without it /sys/bus/spi/drivers/spidev does not exist and the udev rule's
+# bind fails silently.
+echo spidev | sudo tee /etc/modules-load.d/goodixtls-spidev.conf
+sudo modprobe -r spidev 2>/dev/null || true
+sudo modprobe spidev bufsiz=65536      # the sensor sends ~22 kB image frames
+
+# fprintd: the driver opens /dev/gpiochip0 for the reset line and writes under
+# /run/goodixtls/, both refused by the unit's DeviceAllow= / ProtectSystem=strict
+# without this drop-in. Arch's daemon binary is /usr/lib/fprintd
+# (Ubuntu uses /usr/libexec/fprintd).
+sudo mkdir -p /etc/systemd/system/fprintd.service.d
+sudo tee /etc/systemd/system/fprintd.service.d/goodixtls.conf >/dev/null <<'EOF'
+[Service]
+ExecStart=
+ExecStart=/usr/lib/fprintd --no-timeout
+DeviceAllow=/dev/gpiochip0 rw
+RuntimeDirectory=goodixtls
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+EOF
+sudo systemctl daemon-reload
+
+sudo udevadm control --reload
+sudo udevadm trigger --subsystem-match=spidev --subsystem-match=spi
+sudo systemctl restart fprintd         # libfprint enumerates only at startup
+```
+
+There is no `pam-auth-update` on Arch. Add the module to the stacks you want by
+hand; the password stays available as a fallback:
+
+```bash
+sudo sed -i '1i auth      sufficient pam_fprintd.so' /etc/pam.d/sudo
+sudo sed -i '1i auth      sufficient pam_fprintd.so' /etc/pam.d/polkit-1
+```
+
+On an Omarchy install, do **not** run `omarchy setup security fingerprint`: it
+installs the `libfprint-git` AUR package, which replaces the TOD build this
+driver needs. Apply the PAM edits above instead.
+
 ## Runtime prerequisite: spidev node
 
 libfprint enumerates the `spidev` subsystem and associates the driver by the
