@@ -52,7 +52,8 @@ fi
 say "Dependencies"
 MISSING=()
 for p in libfprint-2-tod-dev meson ninja-build build-essential pkg-config \
-         libssl-dev libglib2.0-dev libgudev-1.0-dev python3-gi gir1.2-gtk-4.0; do
+         libssl-dev libglib2.0-dev libgudev-1.0-dev python3-gi \
+         python3-gi-cairo gir1.2-gtk-4.0; do
   dpkg -s "$p" >/dev/null 2>&1 || MISSING+=("$p")
 done
 if [ ${#MISSING[@]} -gt 0 ]; then
@@ -115,6 +116,12 @@ cat > "$DROPIN" <<'EOF'
 [Service]
 ExecStart=
 ExecStart=/usr/libexec/fprintd --no-timeout
+# fprintd.service already declares DeviceAllow= entries. Once any is present
+# systemd enforces a closed device policy, and cgroup device filtering is not
+# bypassable by root: gx_gpio_reset() then gets EPERM on /dev/gpiochip0 and
+# silently skips the reset. SPI keeps working, so the symptom looks like a
+# protocol-timing bug rather than a missing permission.
+DeviceAllow=/dev/gpiochip0 rw
 RuntimeDirectory=goodixtls
 RuntimeDirectoryMode=0755
 RuntimeDirectoryPreserve=yes
