@@ -477,8 +477,13 @@ gx_bio_recv (gpointer ctx, guint8 *b, gsize l)
   return take;
 }
 
-/* Sends a command over the encrypted channel. */
-static int
+/* Sends a command over the encrypted channel.
+ *
+ * Retained but no longer called: its only caller was the TLS MCU_STATE query
+ * at the top of gx_capture_frame(), and on this firmware that query makes the
+ * sensor emit a spurious 0xd0 right after the image ACK (see the note there).
+ * G_GNUC_UNUSED keeps -Wunused-function quiet until something else needs it. */
+static int G_GNUC_UNUSED
 gx_tls_cmd (FpiDeviceGoodixTls *self, guint8 cmd, const guint8 *data, int dl)
 {
   guint8 b[64];
@@ -716,17 +721,6 @@ gx_read_dac_tcode (FpiDeviceGoodixTls *self)
     }
 }
 #endif
-
-static void
-gx_soft_reset_idle (FpiDeviceGoodixTls *self)
-{
-  static const guint8 rst[]  = { 0xa2, 0x03, 0x00, 0x01, 0x00, 0x04 };
-  static const guint8 idle[] = { 0x70, 0x03, 0x00, 0x01, 0x00, 0x36 };
-  gx_send_plain_drain_n (self, rst, sizeof rst, 20);    /* soft reset -> CHIP_RESET */
-  g_usleep (50000 * self->timing_scale / 100);
-  gx_send_plain_drain (self, idle, sizeof idle);
-  g_usleep (20000 * self->timing_scale / 100);
-}
 
 /* Uploads the configuration blob, which opens the command gate, then enables
  * the chip and requests a TLS session. */
