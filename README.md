@@ -1,5 +1,9 @@
 # libfprint-goodixtls — TOD driver for the Goodix GXFP5187 (SPI)
 
+> **You are on the `native-libfprint` branch** — the non-TOD, in-tree
+> libfprint port. It **compiles but is not yet tested on hardware**; see
+> [NATIVE.md](NATIVE.md). The tested, in-service TOD driver is on `main`.
+
 [libfprint](https://fprint.freedesktop.org/) driver (**TOD** variant, the one
 Ubuntu ships) for the **Goodix GXFP5187** SPI fingerprint sensor of the Huawei
 MateBook X Pro (`MACH-WX9`), unsupported upstream (libfprint issue #112).

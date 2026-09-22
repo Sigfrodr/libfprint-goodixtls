@@ -28,7 +28,6 @@
  */
 
 #define FP_COMPONENT "goodixtls"
-#define _GNU_SOURCE
 
 #include <errno.h>
 #include <glib/gstdio.h>
@@ -56,6 +55,14 @@
 #define GOODIX_FINGER_STD    150.0
 /* Largest frame body we ever receive: the image, at about 22 kB. */
 #define GOODIX_RX_MAX        24000
+
+/* Reset GPIO. These defaults match the MateBook X Pro (MACH-WX9); other units
+ * in the family expose the reset on a different gpiochip/line (a MateBook 13,
+ * for one, uses line 264). Until the driver discovers the line from the ACPI
+ * _CRS GpioIo — the proper, portable path, still open — allow an override via
+ * the environment so other units can be brought up without a rebuild. */
+#define GOODIX_RESET_CHIP    "/dev/gpiochip0"
+#define GOODIX_RESET_LINE    58
 
 struct _FpiDeviceGoodixTls
 {
@@ -90,12 +97,6 @@ G_DECLARE_FINAL_TYPE (FpiDeviceGoodixTls, fpi_device_goodixtls, FPI,
                       DEVICE_GOODIXTLS, FpDevice)
 G_DEFINE_TYPE (FpiDeviceGoodixTls, fpi_device_goodixtls, FP_TYPE_DEVICE)
 
-G_MODULE_EXPORT GType
-fpi_tod_shared_driver_get_type (void)
-{
-  return fpi_device_goodixtls_get_type ();
-}
-
 static const FpIdEntry goodixtls_id_table[] = {
   { .udev_types = FPI_DEVICE_UDEV_SUBTYPE_SPIDEV, .spi_acpi_id = "GXFP5187" },
   { .udev_types = 0 }
@@ -114,18 +115,19 @@ static gboolean
 gx_write_frame (FpiDeviceGoodixTls *self, guint8 type,
                 const guint8 *body, gsize n)
 {
-  g_autofree guint8 *buf = g_malloc (n + 4);
-  struct spi_ioc_transfer xfer = { 0 };
+  g_autoptr(FpiSpiTransfer) xfer =
+    fpi_spi_transfer_new (FP_DEVICE (self), self->spi_fd);
 
-  buf[0] = type;
-  buf[1] = n & 0xFF;
-  buf[2] = (n >> 8) & 0xFF;
-  buf[3] = buf[0] + buf[1] + buf[2];
-  memcpy (buf + 4, body, n);
+  /* One frame is exactly one transfer: header (4 bytes) and body go out
+   * together, chip select held low from end to end. */
+  fpi_spi_transfer_write (xfer, n + 4);
+  xfer->buffer_wr[0] = type;
+  xfer->buffer_wr[1] = n & 0xFF;
+  xfer->buffer_wr[2] = (n >> 8) & 0xFF;
+  xfer->buffer_wr[3] = xfer->buffer_wr[0] + xfer->buffer_wr[1] + xfer->buffer_wr[2];
+  memcpy (xfer->buffer_wr + 4, body, n);
 
-  xfer.tx_buf = (unsigned long) buf;
-  xfer.len = n + 4;
-  return ioctl (self->spi_fd, SPI_IOC_MESSAGE (1), &xfer) >= 1;
+  return fpi_spi_transfer_submit_sync (xfer, NULL);
 }
 
 /* Reads one frame: a 4-byte header then the body. Returns the body length,
@@ -135,13 +137,15 @@ gx_read_frame (FpiDeviceGoodixTls *self, guint8 *out_type,
                guint8 *rx, gsize rx_cap)
 {
   guint8 hdr[4] = { 0 };
-  struct spi_ioc_transfer xh = { 0 }, xb = { 0 };
   guint16 n;
 
-  xh.rx_buf = (unsigned long) hdr;
-  xh.len = 4;
-  if (ioctl (self->spi_fd, SPI_IOC_MESSAGE (1), &xh) < 1)
-    return -1;
+  {
+    g_autoptr(FpiSpiTransfer) xh =
+      fpi_spi_transfer_new (FP_DEVICE (self), self->spi_fd);
+    fpi_spi_transfer_read_full (xh, hdr, 4, NULL);
+    if (!fpi_spi_transfer_submit_sync (xh, NULL))
+      return -1;
+  }
   if (hdr[0] != GOODIX_PKT_PLAIN && hdr[0] != GOODIX_PKT_TLS)
     return -1;
   *out_type = hdr[0];
@@ -150,10 +154,13 @@ gx_read_frame (FpiDeviceGoodixTls *self, guint8 *out_type,
     return -1;
 
   g_usleep (200);                    /* let the sensor stage the body */
-  xb.rx_buf = (unsigned long) rx;
-  xb.len = n;
-  if (ioctl (self->spi_fd, SPI_IOC_MESSAGE (1), &xb) < 1)
-    return -1;
+  {
+    g_autoptr(FpiSpiTransfer) xb =
+      fpi_spi_transfer_new (FP_DEVICE (self), self->spi_fd);
+    fpi_spi_transfer_read_full (xb, rx, n, NULL);
+    if (!fpi_spi_transfer_submit_sync (xb, NULL))
+      return -1;
+  }
   return n;
 }
 
@@ -370,23 +377,27 @@ gx_decode_12bit (const guint8 *data, gsize len, guint16 *out, gsize n)
 /*  Init, handshake and frame capture                                  */
 /* ------------------------------------------------------------------ */
 
-/* Hardware reset. The reset line is GPIO 58 on gpiochip0, as declared by the
- * ACPI _CRS. A short PULSE is what the sensor wants; holding the line down was
- * measured to be counter-productive, recovery failing where a pulse succeeds.
- * Without this reset, leftovers from a previous run make init and handshake
- * fail. */
+/* Hardware reset via the ACPI-declared GpioIo (see GOODIX_RESET_* above; the
+ * chip/line are overridable through GOODIXTLS_RESET_CHIP / _LINE for units that
+ * wire the reset elsewhere). A short PULSE is what the sensor wants; holding the
+ * line down was measured to be counter-productive, recovery failing where a
+ * pulse succeeds. Without this reset, leftovers from a previous run make init
+ * and handshake fail. */
 static void
 gx_gpio_reset (FpiDeviceGoodixTls *self)
 {
   struct gpio_v2_line_request req = { 0 };
   struct gpio_v2_line_values val = { 0 };
+  const gchar *chip_path = g_getenv ("GOODIXTLS_RESET_CHIP");
+  const gchar *line_env = g_getenv ("GOODIXTLS_RESET_LINE");
   int chip;
 
-  chip = open ("/dev/gpiochip0", O_RDWR | O_CLOEXEC);
+  chip = open (chip_path ? chip_path : GOODIX_RESET_CHIP, O_RDWR | O_CLOEXEC);
   if (chip < 0)
     return;
   req.num_lines = 1;
-  req.offsets[0] = 58;
+  req.offsets[0] = line_env ? (guint) g_ascii_strtoull (line_env, NULL, 10)
+                            : GOODIX_RESET_LINE;
   req.config.flags = GPIO_V2_LINE_FLAG_OUTPUT;
   g_strlcpy (req.consumer, "goodixtls", sizeof req.consumer);
   if (ioctl (chip, GPIO_V2_GET_LINE_IOCTL, &req) < 0 || req.fd < 0)
@@ -407,16 +418,20 @@ gx_gpio_reset (FpiDeviceGoodixTls *self)
 
 
 
+/* The sensor configuration blob, defined in config_pcap.c. */
+extern const guint8 CONFIG_PCAP[];
+extern const gsize CONFIG_PCAP_LEN;
+
 /* Uploads the configuration blob, which opens the command gate, then enables
  * the chip and requests a TLS session. */
 static gboolean
 gx_upload_config_and_reqtls (FpiDeviceGoodixTls *self)
 {
+  gsize clen;
+
   gx_gpio_reset (self);
 
-  extern const guint8 CONFIG_PCAP[];
-  extern const gsize CONFIG_PCAP_LEN;
-  gsize clen = CONFIG_PCAP_LEN;
+  clen = CONFIG_PCAP_LEN;
   g_autofree guint8 *c = g_malloc (clen + 4);
   guint16 nn = clen + 1;
   guint8 ty, rx[512];
@@ -1815,13 +1830,37 @@ gx_read_psk (FpiDeviceGoodixTls *self, const gchar *path)
   return FALSE;
 }
 
+/* Worker half of the open: the blocking SPI dialogue (reset, firmware read,
+ * PSK read out of the sensor's RAM). Runs off the main loop. */
+static void
+gx_open_thread (GTask *task, gpointer src, gpointer data, GCancellable *c)
+{
+  FpDevice *dev = FP_DEVICE (src);
+  FpiDeviceGoodixTls *self = FPI_DEVICE_GOODIXTLS (dev);
+  const gchar *path =
+    fpi_device_get_udev_data (dev, FPI_DEVICE_UDEV_SUBTYPE_SPIDEV);
+  gchar fw[64] = "";
+
+  gx_gpio_reset (self);
+  if (gx_read_fw_version (self, fw, sizeof fw))
+    fp_info ("GXFP5187 firmware: %s", fw);
+  if (!gx_read_psk (self, path))
+    fp_warn ("key read failed; the TLS channel cannot be opened");
+  g_task_return_boolean (task, TRUE);
+}
+
+static void
+gx_open_done (GObject *src, GAsyncResult *res, gpointer data)
+{
+  fpi_device_open_complete (FP_DEVICE (src), NULL);
+}
+
 static void
 gx_dev_open (FpDevice *dev)
 {
   FpiDeviceGoodixTls *self = FPI_DEVICE_GOODIXTLS (dev);
   GError *err = NULL;
   const gchar *path;
-  gchar fw[64] = "";
 
   /* Drop stores whose fprintd template was deleted meanwhile. */
   gx_adapt_sweep ();
@@ -1864,14 +1903,10 @@ gx_dev_open (FpDevice *dev)
   if (self->timing_scale != 100)
     fp_info ("starting from learned timing scale %d%%", self->timing_scale);
 
-  gx_gpio_reset (self);
-
-  if (gx_read_fw_version (self, fw, sizeof fw))
-    fp_info ("GXFP5187 firmware: %s", fw);
-  if (!gx_read_psk (self, path))
-    fp_warn ("key read failed; the TLS channel cannot be opened");
-
-  fpi_device_open_complete (dev, NULL);
+  /* The reset, firmware read and PSK read are blocking SPI. Run them on a
+   * worker thread so the main loop stays responsive; complete the open from
+   * the callback, which runs back on the main loop. */
+  gx_run_async (NULL, dev, gx_open_thread, gx_open_done);
 }
 
 static void
