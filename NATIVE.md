@@ -85,6 +85,20 @@ GOODIXTLS_RESET_CHIP=/dev/gpiochipN
 GOODIXTLS_RESET_LINE=<line>
 ```
 
+Whatever runs the driver (fprintd, or your own harness) must be allowed to open
+the gpiochip. `fprintd.service` ships a `DeviceAllow=` list that does **not**
+include gpiochip, and once any `DeviceAllow=` is present systemd enforces a closed
+device policy that not even root bypasses — the reset then fails with `EPERM`
+while SPI keeps working, so the only symptom is a sensor that looks like it has a
+protocol-timing bug. The driver now logs that case instead of failing silently;
+to fix it, grant the node in a drop-in:
+
+```
+# /etc/systemd/system/fprintd.service.d/goodixtls.conf
+[Service]
+DeviceAllow=/dev/gpiochip0 rw
+```
+
 ## Extending to the rest of the Milan-SPI family
 
 This variant is meant to grow into a single driver for the family (`GXFP5187`,

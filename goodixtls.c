@@ -390,27 +390,41 @@ gx_gpio_reset (FpiDeviceGoodixTls *self)
   struct gpio_v2_line_values val = { 0 };
   const gchar *chip_path = g_getenv ("GOODIXTLS_RESET_CHIP");
   const gchar *line_env = g_getenv ("GOODIXTLS_RESET_LINE");
+  guint line = line_env ? (guint) g_ascii_strtoull (line_env, NULL, 10)
+                        : GOODIX_RESET_LINE;
   int chip;
 
-  chip = open (chip_path ? chip_path : GOODIX_RESET_CHIP, O_RDWR | O_CLOEXEC);
+  chip_path = chip_path ? chip_path : GOODIX_RESET_CHIP;
+  chip = open (chip_path, O_RDWR | O_CLOEXEC);
   if (chip < 0)
-    return;
+    {
+      /* Never silent: fprintd's DeviceAllow= policy denies this even to root,
+       * and SPI still works without the reset, so the only symptom is a sensor
+       * that behaves like a protocol-timing bug. */
+      fp_warn ("reset: cannot open %s (%s); reset skipped "
+               "(see DeviceAllow= in fprintd.service.d)", chip_path,
+               g_strerror (errno));
+      return;
+    }
   req.num_lines = 1;
-  req.offsets[0] = line_env ? (guint) g_ascii_strtoull (line_env, NULL, 10)
-                            : GOODIX_RESET_LINE;
+  req.offsets[0] = line;
   req.config.flags = GPIO_V2_LINE_FLAG_OUTPUT;
   g_strlcpy (req.consumer, "goodixtls", sizeof req.consumer);
   if (ioctl (chip, GPIO_V2_GET_LINE_IOCTL, &req) < 0 || req.fd < 0)
     {
+      fp_warn ("reset: cannot request line %u on %s: %s", line, chip_path,
+               g_strerror (errno));
       close (chip);
       return;
     }
   val.mask = 1;
   val.bits = 0;                          /* assert reset */
-  ioctl (req.fd, GPIO_V2_LINE_SET_VALUES_IOCTL, &val);
+  if (ioctl (req.fd, GPIO_V2_LINE_SET_VALUES_IOCTL, &val) < 0)
+    fp_warn ("reset: cannot assert line %u: %s", line, g_strerror (errno));
   g_usleep (10000);
   val.bits = 1;                          /* release */
-  ioctl (req.fd, GPIO_V2_LINE_SET_VALUES_IOCTL, &val);
+  if (ioctl (req.fd, GPIO_V2_LINE_SET_VALUES_IOCTL, &val) < 0)
+    fp_warn ("reset: cannot release line %u: %s", line, g_strerror (errno));
   g_usleep (120000);
   close (req.fd);
   close (chip);
