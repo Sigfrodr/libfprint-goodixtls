@@ -107,6 +107,12 @@ python3 fp_eval.py --captures ./captures --backend-so ./example_ncc.so
 This is how each of us scores our own shipped matcher on our own data, so the
 pooled numbers describe the drivers people really run — not stand-ins.
 
+A real-world example is [`plugin/gq_sigfm.c`](plugin/gq_sigfm.c) (contributed by
+@szlukabence on issue #5): a ~30-line adapter over GodsQuantum's GXFP51A0 matcher.
+It isn't self-contained — you build it against that driver's sources (see the
+header) — but it shows the pattern. Measured on a GXFP51A0 it put the real matcher
+at EER ≈ 4.7 % where NBIS on the same 80×64 captures was 50 % (chance).
+
 ## Reading the result
 
 ```
