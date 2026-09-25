@@ -5,13 +5,23 @@ same reverse-engineered protocol and open matcher as `main`, restructured to be
 built **inside the libfprint source tree** rather than as a TOD (Touch-on-Device)
 shared module.
 
-> **Status: compiles, not yet tested on hardware.** With the sources dropped into
-> a libfprint checkout and the meson snippets below applied, libfprint builds
-> cleanly and `fprint-list-supported-devices` lists `GXFP5187`. It has **not** yet
-> been exercised against a real sensor in this configuration. The tested,
-> in-service variant is the TOD driver on the `main` branch (session unlock and
-> `sudo` confirmed). Treat this branch as the basis for an upstream libfprint MR,
-> not as a ready-to-install driver.
+> **Status: hardware-validated bring-up (MateBook X Pro, GXFP5187).** Built into a
+> current libfprint `main` checkout (the patch applies cleanly there; on 1.94.x the
+> meson layout differs), `fprint-list-supported-devices` lists `GXFP5187` and the
+> native driver, run against the real sensor, completes the whole non-biometric
+> path: probe → open → GPIO reset → firmware read (`GF3288_ST411SEC_APP_11033`) →
+> PSK read → **TLS-PSK handshake up (`PSK-AES128-CBC-SHA256`)** → enrol started
+> (finger requested). Full enrol/verify matching wasn't run in this harness (needs
+> a finger), but the SPI transport, reset, PSK and TLS all work natively via
+> `FpiSpiTransfer`. The tested day-to-day variant is still the TOD driver on `main`.
+>
+> **Requires one upstream libfprint fix.** `fpi_spi_transfer_submit_sync()` calls
+> `g_propagate_error(error, err)` unconditionally, so every *successful* synchronous
+> transfer trips `g_propagate_error: assertion 'src != NULL' failed`. Async-only SPI
+> drivers never hit it; this driver uses `submit_sync` in its worker threads and
+> surfaces it (~1400 criticals in one enrol). One-line fix — guard with `if (err)` —
+> silences it completely (patch: `libfprint-submit-sync-nullerror.patch`); worth
+> sending upstream alongside the driver MR.
 
 ## Why a separate variant
 
