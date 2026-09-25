@@ -370,35 +370,131 @@ gx_decode_12bit (const guint8 *data, gsize len, guint16 *out, gsize n)
 /*  Init, handshake and frame capture                                  */
 /* ------------------------------------------------------------------ */
 
-/* Hardware reset. The reset line is GPIO 58 on gpiochip0, as declared by the
- * ACPI _CRS. A short PULSE is what the sensor wants; holding the line down was
- * measured to be counter-productive, recovery failing where a pulse succeeds.
- * Without this reset, leftovers from a previous run make init and handshake
- * fail. */
+/* Best-effort discovery of the reset GpioIo from the ACPI _CRS, so the line is
+ * not hardcoded across units (MateBook X Pro = gpiochip0/58, MateBook 13 = 264).
+ * Reads the DSDT, finds the sensor device, and decodes the reset pin from the
+ * Intel GNUM-encoded global the _CRS feeds its GpioIo:
+ *     pin = (enc & 0xFFFF) + ((enc >> 16) & 0xFF) * 24
+ * then picks the gpiochip with enough lines. Intel-platform specific; the caller
+ * falls back to a compiled default and the GOODIXTLS_RESET_* overrides. The
+ * assert polarity is not in _CRS, so it stays a per-model default. */
+static guint
+gx_gnum_decode (guint32 enc)
+{
+  return (enc & 0xFFFF) + (((enc >> 16) & 0xFF) * 24);
+}
+
+static gboolean
+gx_discover_reset (gchar **chip_out, guint *line_out)
+{
+  g_autofree gchar *dsdt = NULL;
+  gsize len = 0;
+
+  if (!g_file_get_contents ("/sys/firmware/acpi/tables/DSDT", &dsdt, &len, NULL))
+    return FALSE;
+
+  const guint8 *d = (const guint8 *) dsdt;
+  gssize off = -1;
+  for (gsize i = 0; i + 8 <= len; i++)
+    if (memcmp (d + i, "GXFP5187", 8) == 0) { off = i; break; }
+  if (off < 0)
+    return FALSE;
+  gsize end = MIN ((gsize) off + 700, len);
+
+  gboolean has_io = FALSE;
+  for (gsize k = off; k + 5 < end; k++)
+    if (d[k] == 0x8C && d[k + 3] == 1 && d[k + 4] == 1) { has_io = TRUE; break; }
+  if (!has_io)
+    return FALSE;
+
+  /* GNUM-encoded globals are DWordConst (0x0C + LE u32) referenced twice (SHPO in
+   * _INI, GNUM in _CRS). First-seen order: [0] = GpioInt (IRQ), [1] = GpioIo
+   * (reset). */
+  guint32 seen[8]; int nseen = 0, count[8] = { 0 };
+  for (gsize k = off; k + 5 < end; k++)
+    {
+      if (d[k] != 0x0C)
+        continue;
+      guint32 v = d[k + 1] | (d[k + 2] << 8) | (d[k + 3] << 16) | ((guint32) d[k + 4] << 24);
+      if (((v >> 16) & 0xFF) >= 0x10 || (v & 0xFFFF) >= 0x400 || gx_gnum_decode (v) >= 512)
+        continue;
+      int idx = -1;
+      for (int s = 0; s < nseen; s++) if (seen[s] == v) idx = s;
+      if (idx < 0 && nseen < 8) { seen[nseen] = v; idx = nseen++; }
+      if (idx >= 0) count[idx]++;
+    }
+  guint32 globs[8]; int ng = 0;
+  for (int s = 0; s < nseen; s++) if (count[s] >= 2 && ng < 8) globs[ng++] = seen[s];
+  if (ng < 2)
+    return FALSE;
+  guint line = gx_gnum_decode (globs[1]);
+
+  for (int n = 0; n < 8; n++)
+    {
+      g_autofree gchar *path = g_strdup_printf ("/dev/gpiochip%d", n);
+      int fd = open (path, O_RDONLY | O_CLOEXEC);
+      if (fd < 0)
+        { if (n == 0) continue; else break; }
+      struct gpiochip_info ci = { 0 };
+      gboolean ok = ioctl (fd, GPIO_GET_CHIPINFO_IOCTL, &ci) >= 0 && ci.lines > line;
+      close (fd);
+      if (ok) { *chip_out = g_steal_pointer (&path); *line_out = line; return TRUE; }
+    }
+  return FALSE;
+}
+
+/* Hardware reset via the ACPI-declared GpioIo. The line is resolved in order:
+ * the GOODIXTLS_RESET_CHIP / _LINE overrides, then best-effort discovery from the
+ * ACPI _CRS, then the compiled default (GPIO 58 on gpiochip0, this unit). A short
+ * PULSE is what the sensor wants; holding the line down was measured to be
+ * counter-productive, recovery failing where a pulse succeeds. Without this reset,
+ * leftovers from a previous run make init and handshake fail. */
 static void
 gx_gpio_reset (FpiDeviceGoodixTls *self)
 {
   struct gpio_v2_line_request req = { 0 };
   struct gpio_v2_line_values val = { 0 };
+  const gchar *chip_env = g_getenv ("GOODIXTLS_RESET_CHIP");
+  const gchar *line_env = g_getenv ("GOODIXTLS_RESET_LINE");
+  g_autofree gchar *disc_chip = NULL;
+  const gchar *chip_path;
+  guint line;
   int chip;
 
-  chip = open ("/dev/gpiochip0", O_RDWR | O_CLOEXEC);
+  if (chip_env || line_env)
+    {
+      chip_path = chip_env ? chip_env : "/dev/gpiochip0";
+      line = line_env ? (guint) g_ascii_strtoull (line_env, NULL, 10) : 58;
+    }
+  else if (gx_discover_reset (&disc_chip, &line))
+    {
+      chip_path = disc_chip;
+      fp_dbg ("reset: %s line %u discovered from ACPI _CRS", chip_path, line);
+    }
+  else
+    {
+      chip_path = "/dev/gpiochip0";
+      line = 58;
+    }
+
+  chip = open (chip_path, O_RDWR | O_CLOEXEC);
   if (chip < 0)
     {
       /* Never silent: fprintd's DeviceAllow= policy denies this even to root,
        * and SPI still works without the reset, so the only symptom is a sensor
        * that behaves like a protocol-timing bug. */
-      fp_warn ("reset: cannot open /dev/gpiochip0 (%s); reset skipped "
-               "(see DeviceAllow= in fprintd.service.d)", g_strerror (errno));
+      fp_warn ("reset: cannot open %s (%s); reset skipped "
+               "(see DeviceAllow= in fprintd.service.d)", chip_path,
+               g_strerror (errno));
       return;
     }
   req.num_lines = 1;
-  req.offsets[0] = 58;
+  req.offsets[0] = line;
   req.config.flags = GPIO_V2_LINE_FLAG_OUTPUT;
   g_strlcpy (req.consumer, "goodixtls", sizeof req.consumer);
   if (ioctl (chip, GPIO_V2_GET_LINE_IOCTL, &req) < 0 || req.fd < 0)
     {
-      fp_warn ("reset: cannot request line 58 on /dev/gpiochip0: %s",
+      fp_warn ("reset: cannot request line %u on %s: %s", line, chip_path,
                g_strerror (errno));
       close (chip);
       return;
@@ -406,11 +502,11 @@ gx_gpio_reset (FpiDeviceGoodixTls *self)
   val.mask = 1;
   val.bits = 0;                          /* assert reset */
   if (ioctl (req.fd, GPIO_V2_LINE_SET_VALUES_IOCTL, &val) < 0)
-    fp_warn ("reset: cannot assert line 58: %s", g_strerror (errno));
+    fp_warn ("reset: cannot assert line %u: %s", line, g_strerror (errno));
   g_usleep (10000);
   val.bits = 1;                          /* release */
   if (ioctl (req.fd, GPIO_V2_LINE_SET_VALUES_IOCTL, &val) < 0)
-    fp_warn ("reset: cannot release line 58: %s", g_strerror (errno));
+    fp_warn ("reset: cannot release line %u: %s", line, g_strerror (errno));
   g_usleep (120000);
   close (req.fd);
   close (chip);
