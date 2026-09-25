@@ -12,7 +12,15 @@ cc = meson.get_compiler('c')
 
 libfprint_tod_dep = dependency('libfprint-2-tod-1')
 gmodule_dep = dependency('gmodule-2.0')
-udev = dependency('udev')
+# udev.pc is gone on Ubuntu 26.04 (only libudev.pc remains). The dependency is
+# only used to locate the rules directory, which install.sh overrides anyway, so
+# it is optional with a conventional fallback.
+udev = dependency('udev', required: false)
+if udev.found()
+  udevdir = udev.get_variable(pkgconfig: 'udevdir')
+else
+  udevdir = '/usr/lib/udev'
+endif
 m_dep = cc.find_library('m', required: false)
 
 # Stock OpenSSL. The sensor's 48-byte PSK is well within OpenSSL's limit, and
@@ -44,5 +52,5 @@ goodixtls_driver = shared_module('goodixtls-tod-driver',
 install_data('goodixtls-spidev.conf',
     install_dir: get_option('sysconfdir') / 'modprobe.d')
 install_data('60-libfprint-2-goodixtls.rules',
-    install_dir: udev.get_variable(pkgconfig: 'udevdir') / 'rules.d',
+    install_dir: udevdir / 'rules.d',
 )

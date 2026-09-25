@@ -18,15 +18,34 @@
 # short pulse succeeds.
 set -e
 DEV=spi-GXFP5187:00
+
+# libgpiod 2.x moved the chip behind -c and holds lines until the process
+# exits, so a pulse needs "-t 0"; libgpiod 1.x takes the chip positionally and
+# releases on exit. Both forms are tried so recovery works with either.
+# Never call this through "|| true": a missing or failing gpioset must be
+# visible, because a silent failure here is indistinguishable from a sensor
+# that will not come back.
+gpio_pulse() {  # line assert release
+  local line=$1 assert=$2 release=$3
+  if gpioset --version 2>/dev/null | grep -qE 'v?2\.'; then
+    sudo gpioset -c gpiochip0 -t 0 "$line=$assert" &&
+    sudo gpioset -c gpiochip0 -t 0 "$line=$release"
+  else
+    sudo gpioset gpiochip0 "$line=$assert" &&
+    sudo gpioset gpiochip0 "$line=$release"
+  fi
+}
 echo "Stopping fprintd..."     ; sudo systemctl stop fprintd; sleep 1
 echo "Unbinding spidev..."    ; echo $DEV | sudo tee /sys/bus/spi/drivers/spidev/unbind >/dev/null 2>&1 || true; sleep 1
-# gpioset releases the line as soon as it exits: without "-m time" the reset is
-# not HELD, it is only brushed — and the sensor does not come back from it.
 # A SHORT pulse, not a hold: measured, keeping the line low for two seconds
 # prevents the recovery that a pulse allows. The ingredient that actually
 # matters here is the spidev unbind and rebind.
-echo "Reset..."               ; sudo gpioset gpiochip0 58=0 || true; sleep 2
-                                sudo gpioset gpiochip0 58=1 || true; sleep 2
+echo "Reset..."
+if ! gpio_pulse 58 0 1; then
+  echo "WARNING: gpioset failed (libgpiod installed? permission denied?)." >&2
+  echo "         The spidev unbind/rebind below is what clears the lock-up." >&2
+fi
+sleep 2
 # Load the module before rebinding: without it the bind directory does not
 # exist and the rebind fails silently.
 echo "Rebinding spidev..."   ; sudo modprobe spidev
