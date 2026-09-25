@@ -81,6 +81,32 @@ code. The goal isn't to crown a matcher — it's one defensible FAR/FRR per
 backend on identical data, so the NBIS-vs-host-matching gap is measured the same
 way everywhere.
 
+## Scoring your driver's REAL matcher (`--backend-so`)
+
+The reference backends deliberately under-sell a real, tuned matcher — on a
+GXFP51A0 set the numpy backend measured EER ≈ 18 % where the shipped SIGFM matcher
+was ≈ 4.8 % on the *same* images. So to describe the matcher people actually run,
+plug it in directly:
+
+```
+python3 fp_eval.py --captures ./captures --backend-so ./mymatcher.so
+```
+
+Write a thin adapter implementing the four-function ABI in
+[`plugin/fp_eval_plugin.h`](plugin/fp_eval_plugin.h), compile it together with
+your matcher into a `.so`, and pass it above (repeat `--backend-so` for several).
+Your matcher then runs under the *same* held-out split, metrics and
+aggregates-only report as every other backend. A complete, compilable example is
+in [`plugin/example_ncc.c`](plugin/example_ncc.c):
+
+```
+cc -O2 -shared -fPIC -o example_ncc.so plugin/example_ncc.c -lm
+python3 fp_eval.py --captures ./captures --backend-so ./example_ncc.so
+```
+
+This is how each of us scores our own shipped matcher on our own data, so the
+pooled numbers describe the drivers people really run — not stand-ins.
+
 ## Reading the result
 
 ```

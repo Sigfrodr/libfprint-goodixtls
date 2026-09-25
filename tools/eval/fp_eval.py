@@ -38,6 +38,7 @@
 # (SIFT/ORB) and NBIS (mindtct/bozorth3) are used too when installed.
 
 import argparse
+import ctypes
 import glob
 import json
 import math
@@ -308,6 +309,69 @@ def _score_nbis(xyt_probe, xyt_gallery):
     return float(out.stdout.strip() or 0)
 
 # --------------------------------------------------------------------------- #
+# Plug-in backend: a driver's REAL matcher, loaded from a shared library.
+#
+# The reference numpy/sift/orb backends under-sell an actual shipped matcher
+# (they are neutral stand-ins). To measure the matcher people really run, a
+# driver author compiles a thin adapter to a .so exporting the plug-in ABI
+# (see plugin/fp_eval_plugin.h) and passes it with --backend-so:
+#
+#     void  *fpeval_extract(const uint8_t *img, int w, int h);  // opaque handle
+#     double fpeval_score(void *probe, void *gallery);          // higher = closer
+#     void   fpeval_free(void *feat);
+#     const char *fpeval_name(void);                            // optional label
+#
+# Images are row-major 8-bit grayscale, w*h bytes. Everything else (the held-out
+# split, the metrics, the aggregates-only report) is unchanged.
+# --------------------------------------------------------------------------- #
+
+class _SoFeat:
+    __slots__ = ("_lib", "handle")
+
+    def __init__(self, lib, handle):
+        self._lib = lib
+        self.handle = handle
+
+    def __del__(self):
+        if self.handle:
+            try:
+                self._lib.fpeval_free(ctypes.c_void_p(self.handle))
+            except Exception:
+                pass
+
+
+class SharedLibBackend:
+    def __init__(self, path):
+        self.lib = ctypes.CDLL(path)
+        self.lib.fpeval_extract.restype = ctypes.c_void_p
+        self.lib.fpeval_extract.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
+        self.lib.fpeval_score.restype = ctypes.c_double
+        self.lib.fpeval_score.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        self.lib.fpeval_free.restype = None
+        self.lib.fpeval_free.argtypes = [ctypes.c_void_p]
+        self.label = os.path.splitext(os.path.basename(path))[0]
+        if hasattr(self.lib, "fpeval_name"):
+            try:
+                self.lib.fpeval_name.restype = ctypes.c_char_p
+                n = self.lib.fpeval_name()
+                if n:
+                    self.label = n.decode()
+            except Exception:
+                pass
+
+    def extract(self, img):
+        u8 = np.ascontiguousarray(np.clip(img, 0, 255).astype(np.uint8))
+        h, w = u8.shape
+        handle = self.lib.fpeval_extract(u8.tobytes(), int(w), int(h))
+        return _SoFeat(self.lib, handle)
+
+    def score(self, fa, fb):
+        if not fa.handle or not fb.handle:
+            return 0.0
+        return float(self.lib.fpeval_score(ctypes.c_void_p(fa.handle),
+                                           ctypes.c_void_p(fb.handle)))
+
+# --------------------------------------------------------------------------- #
 # Metrics
 # --------------------------------------------------------------------------- #
 
@@ -544,6 +608,9 @@ def main():
                     help="integer upscale before matching (small sensors: try 3)")
     ap.add_argument("--backends", default="auto",
                     help="comma list of numpy,sift,orb,nbis (default: auto)")
+    ap.add_argument("--backend-so", action="append", default=[], metavar="PATH",
+                    help="a driver's real matcher as a shared library exporting "
+                         "the plug-in ABI (repeatable; see plugin/)")
     ap.add_argument("--json", help="also write the full report to this file")
     args = ap.parse_args()
 
@@ -579,6 +646,18 @@ def main():
         else:
             print(f"unknown backend: {b}", file=sys.stderr); continue
         results[b] = evaluate(gen, imp)
+
+    for so in args.backend_so:
+        try:
+            backend = SharedLibBackend(so)
+        except Exception as e:
+            print(f"skip {so}: {e}", file=sys.stderr); continue
+        gen, imp = run_backend(backend.label, backend.extract, backend.score,
+                               imgs, args.enroll, args.repeats)
+        label = backend.label
+        while label in results:
+            label += "*"
+        results[label] = evaluate(gen, imp)
 
     report = dict(
         meta=dict(sensor=args.sensor, n_fingers=len(imgs),
