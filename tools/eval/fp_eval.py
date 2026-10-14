@@ -320,6 +320,8 @@ def _score_nbis(xyt_probe, xyt_gallery):
 #     double fpeval_score(void *probe, void *gallery);          // higher = closer
 #     void   fpeval_free(void *feat);
 #     const char *fpeval_name(void);                            // optional label
+#     double fpeval_score_gallery(void *probe, void **gallery, int n);
+#                                     // optional: fused score over the gallery
 #
 # Images are row-major 8-bit grayscale, w*h bytes. Everything else (the held-out
 # split, the metrics, the aggregates-only report) is unchanged.
@@ -350,6 +352,12 @@ class SharedLibBackend:
         self.lib.fpeval_free.restype = None
         self.lib.fpeval_free.argtypes = [ctypes.c_void_p]
         self.label = os.path.splitext(os.path.basename(path))[0]
+        self.gallery = None
+        if hasattr(self.lib, "fpeval_score_gallery"):
+            self.lib.fpeval_score_gallery.restype = ctypes.c_double
+            self.lib.fpeval_score_gallery.argtypes = [
+                ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p), ctypes.c_int]
+            self.gallery = self.score_gallery
         if hasattr(self.lib, "fpeval_name"):
             try:
                 self.lib.fpeval_name.restype = ctypes.c_char_p
@@ -370,6 +378,13 @@ class SharedLibBackend:
             return 0.0
         return float(self.lib.fpeval_score(ctypes.c_void_p(fa.handle),
                                            ctypes.c_void_p(fb.handle)))
+
+    def score_gallery(self, probe, gallery):
+        if not probe.handle:
+            return 0.0
+        arr = (ctypes.c_void_p * len(gallery))(*[g.handle for g in gallery])
+        return float(self.lib.fpeval_score_gallery(
+            ctypes.c_void_p(probe.handle), arr, len(gallery)))
 
 # --------------------------------------------------------------------------- #
 # Metrics
@@ -485,7 +500,12 @@ def _split(n_views, enroll, rng):
     return idx[:e], idx[e:]
 
 
-def run_backend(name, feat_fn, score_fn, imgs, enroll, repeats):
+def run_backend(name, feat_fn, score_fn, imgs, enroll, repeats, gallery_fn=None):
+    # A probe's score against a gallery: the backend's own fusion if it has
+    # one, otherwise its best single view.
+    if gallery_fn is None:
+        def gallery_fn(p, gallery):
+            return max((score_fn(p, g) for g in gallery), default=0.0)
     # Pre-extract features once per view.
     feats = {f: [feat_fn(im) for im in views] for f, views in imgs.items()}
     gen, imp = [], []
@@ -499,15 +519,13 @@ def run_backend(name, feat_fn, score_fn, imgs, enroll, repeats):
             gallery = [views[i] for i in e_idx]
             # genuine: held-out probes of this finger vs its own gallery
             for pi in p_idx:
-                s = max((score_fn(views[pi], g) for g in gallery), default=0.0)
-                gen.append(s)
+                gen.append(gallery_fn(views[pi], gallery))
             # impostor: every other finger's views vs this gallery
             for ofid, oviews in feats.items():
                 if ofid == fid:
                     continue
                 for ov in oviews:
-                    s = max((score_fn(ov, g) for g in gallery), default=0.0)
-                    imp.append(s)
+                    imp.append(gallery_fn(ov, gallery))
     return gen, imp
 
 
@@ -653,7 +671,7 @@ def main():
         except Exception as e:
             print(f"skip {so}: {e}", file=sys.stderr); continue
         gen, imp = run_backend(backend.label, backend.extract, backend.score,
-                               imgs, args.enroll, args.repeats)
+                               imgs, args.enroll, args.repeats, backend.gallery)
         label = backend.label
         while label in results:
             label += "*"

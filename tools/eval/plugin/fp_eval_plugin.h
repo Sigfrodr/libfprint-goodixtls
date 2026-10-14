@@ -37,6 +37,12 @@ void fpeval_free(void *feat);
 /* Optional: a short label for the report (e.g. "gq-sigfm"). May be omitted. */
 const char *fpeval_name(void);
 
+/* Optional: score a probe against a whole enrolled gallery at once, for
+ * matchers whose decision fuses evidence across views instead of keeping the
+ * best single view. When present it replaces max over fpeval_score(); when
+ * omitted the harness keeps that best-of-gallery rule. */
+double fpeval_score_gallery(void *probe, void **gallery, int n);
+
 #ifdef __cplusplus
 }
 #endif
