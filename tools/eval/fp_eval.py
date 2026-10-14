@@ -563,7 +563,7 @@ def run_nbis(imgs, enroll, repeats):
         return gen, imp
 
 
-def evaluate(gen, imp):
+def evaluate(gen, imp, thresholds=()):
     eer, eer_thr = _eer(gen, imp)
     far1, _ = _far_at_frr(gen, imp, 0.01)
     far5, _ = _far_at_frr(gen, imp, 0.05)
@@ -575,6 +575,8 @@ def evaluate(gen, imp):
         far_at_frr_1pct=far1, far_at_frr_5pct=far5,
         frr_at_far_0p1pct=frr01, frr_at_far_1pct=frr1,
         histogram=_hist(gen, imp),
+        at_threshold={f"{t:g}": dict(zip(("far", "frr"), _rates(gen, imp, t)))
+                      for t in thresholds},
     )
 
 # --------------------------------------------------------------------------- #
@@ -606,6 +608,9 @@ def print_report(report):
               f"(threshold at EER = {r['eer_threshold']:.3f})")
         print(f"  FAR @ FRR=1% : {_fmt_pct(r['far_at_frr_1pct'])}     "
               f"FRR @ FAR=0.1% : {_fmt_pct(r['frr_at_far_0p1pct'])}")
+        for t, v in r.get("at_threshold", {}).items():
+            print(f"  at threshold {t:>6} : FAR {_fmt_pct(v['far'])}   "
+                  f"FRR {_fmt_pct(v['frr'])}")
         print()
     print("Post the block above (or the --json file) on the issue. It contains")
     print("only counts and statistics — no images, templates or file names.")
@@ -625,14 +630,19 @@ def main():
     ap.add_argument("--upscale", type=int, default=1,
                     help="integer upscale before matching (small sensors: try 3)")
     ap.add_argument("--backends", default="auto",
-                    help="comma list of numpy,sift,orb,nbis (default: auto)")
+                    help="comma list of numpy,sift,orb,nbis, or none to run only "
+                         "--backend-so plug-ins (default: auto)")
     ap.add_argument("--backend-so", action="append", default=[], metavar="PATH",
                     help="a driver's real matcher as a shared library exporting "
                          "the plug-in ABI (repeatable; see plugin/)")
+    ap.add_argument("--at-threshold", type=float, action="append", default=[],
+                    metavar="T", help="also report FAR/FRR at this decision "
+                    "threshold, e.g. your driver's (repeatable)")
     ap.add_argument("--json", help="also write the full report to this file")
     args = ap.parse_args()
 
-    want = args.backends.split(",") if args.backends != "auto" else \
+    want = [] if args.backends == "none" else \
+        args.backends.split(",") if args.backends != "auto" else \
         ["numpy"] + (["sift", "orb"] if _HAVE_CV2 else []) + (["nbis"] if _HAVE_NBIS else [])
 
     imgs = _load_dataset(args.captures, args.upscale)
@@ -663,7 +673,7 @@ def main():
             gen, imp = out
         else:
             print(f"unknown backend: {b}", file=sys.stderr); continue
-        results[b] = evaluate(gen, imp)
+        results[b] = evaluate(gen, imp, args.at_threshold)
 
     for so in args.backend_so:
         try:
@@ -675,7 +685,7 @@ def main():
         label = backend.label
         while label in results:
             label += "*"
-        results[label] = evaluate(gen, imp)
+        results[label] = evaluate(gen, imp, args.at_threshold)
 
     report = dict(
         meta=dict(sensor=args.sensor, n_fingers=len(imgs),

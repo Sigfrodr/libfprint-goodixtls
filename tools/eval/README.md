@@ -65,7 +65,10 @@ python3 fp_eval.py --captures ./captures --sensor "GXFP5187 132x112" \
 - `--repeats R` — averages over R random enrol/probe splits.
 - `--upscale K` — integer upscale before matching; on a ~6 mm sensor `--upscale 3`
   is often worth trying.
-- `--backends numpy,sift,orb,nbis` — defaults to every backend available.
+- `--backends numpy,sift,orb,nbis` — defaults to every backend available;
+  `none` runs only the `--backend-so` plug-ins.
+- `--at-threshold T` — also report FAR and FRR at your driver's own decision
+  threshold (repeatable), not only at the EER point.
 
 ## What each backend is
 
@@ -126,10 +129,11 @@ FRR it reports is a pessimistic bound.
 
 [`collect-goodix.sh`](collect-goodix.sh) does the whole run on a GXFP5187: it
 enables the driver's capture dump, enrols each test finger twice with
-`fprintd-enroll` (about 60 captures: a 30-view gallery like the driver's, plus
-held-out probes), deletes each test enrolment again, converts the dumps with
+`fprintd-enroll` (roughly 30 usable captures per finger once empty second
+views are dropped), deletes each test enrolment again, converts the dumps with
 [`goodix_dump.py`](goodix_dump.py) (the driver's own preprocessing and
-no-finger rejection), builds the plug-in and runs the harness with `--enroll 30`:
+no-finger rejection), builds the plug-in and runs it alone with `--enroll 15`,
+reporting FAR/FRR at the driver's threshold (`--at-threshold 15`):
 
 ```
 ./collect-goodix.sh ~/fp-eval-goodix left-index-finger left-middle-finger \
