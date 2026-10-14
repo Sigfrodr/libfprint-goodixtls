@@ -90,6 +90,10 @@ struct _FpiDeviceGoodixTls
   int        fdt_abs;        /* per-unit absolute floor, derived from baseline */
   int        timing_scale;   /* protocol-delay multiplier in %, grows on desync */
   int        timing_saved;   /* last value persisted to disk, to avoid rewrites */
+  int        timing_clean;   /* consecutive sessions without a capture failure */
+  gboolean   capture_failed; /* a capture failed during this open */
+  gboolean   handshaking;    /* in the TLS handshake: short receive budget */
+  int        fdt_known;      /* persisted idle FDT mean, 0 if none yet */
   gboolean   worker_active;   /* a work thread is running; close must wait */
   gboolean   close_pending;   /* close was asked while a worker ran; do it after */
   gboolean   bg_dirty;       /* background taken with a finger down */
@@ -264,6 +268,11 @@ gx_bio_send (gpointer ctx, const guint8 *b, gsize l)
   return (int) l;
 }
 
+/* Receive budget during the handshake, in 20 ms polls. Its records arrive
+ * within one or two polls when the sensor answers at all; when it does not,
+ * the full 4 s budget only delayed the retry that does connect. */
+#define GX_HS_POLLS 50
+
 static int
 gx_bio_recv (gpointer ctx, guint8 *b, gsize l)
 {
@@ -275,9 +284,9 @@ gx_bio_recv (gpointer ctx, guint8 *b, gsize l)
     {
       /* Buffer empty: pull fresh TLS frames, skipping cleartext ones. The
        * sensor takes a while to produce the image, hence the generous poll. */
-      int r = -1;
+      int r = -1, polls = self->handshaking ? GX_HS_POLLS : 200;
       self->tls_rxlen = self->tls_rxpos = 0;
-      for (i = 0; i < 200; i++)
+      for (i = 0; i < polls; i++)
         {
           r = gx_read_frame (self, &ty, self->tls_rx, GOODIX_RX_MAX);
           if (r > 0 && ty == GOODIX_PKT_TLS)
@@ -613,11 +622,14 @@ gx_tls_handshake (FpiDeviceGoodixTls *self)
       fp_warn ("cannot set up the TLS channel");
       return FALSE;
     }
+  self->handshaking = TRUE;
   if (!gx_tls_handshake_run (self->tls, &err))
     {
+      self->handshaking = FALSE;
       fp_warn ("%s", err->message);
       return FALSE;
     }
+  self->handshaking = FALSE;
   fp_info ("TLS-PSK session up (%s)", gx_tls_ciphersuite (self->tls));
   self->tls_up = TRUE;
   return TRUE;
@@ -633,6 +645,8 @@ gx_tls_teardown (FpiDeviceGoodixTls *self)
     }
   g_clear_pointer (&self->tls, gx_tls_free);
 }
+
+static void gx_timing_capture_failed (FpiDeviceGoodixTls *self);
 
 /* Exact image capture sequence, as observed on the wire. */
 static void
@@ -728,6 +742,7 @@ gx_capture_frame (FpiDeviceGoodixTls *self, guint16 *px)
     if (got < 0)
       {
         fp_warn ("cannot decrypt the image record (%d raw bytes)", raw);
+        gx_timing_capture_failed (self);
         return FALSE;
       }
     total = (int) got;
@@ -737,6 +752,7 @@ gx_capture_frame (FpiDeviceGoodixTls *self, guint16 *px)
   if (total < 22176)
     {
       fp_warn ("incomplete image: %d bytes", total);
+      gx_timing_capture_failed (self);
       return FALSE;
     }
   /* Header is a tag, a 16-bit length and five zero bytes, then the 12-bit
@@ -913,36 +929,129 @@ gx_read_fw_version (FpiDeviceGoodixTls *self, gchar *out, gsize cap)
 
 /* Learned protocol-timing multiplier, remembered across opens.
  *
- * timing_scale grows within a session when the sensor loses sync (see below),
- * but resets to nominal on every open — so a consistently slow unit paid one
- * failed handshake at the start of every session. Persisting the last value
- * that WORKED skips that: the next open starts at the timing this unit is known
- * to need. It lives in fprintd's state directory (the only writable path under
- * ProtectSystem=strict), is device- not user-scoped, and is a single integer.
- * Delete the file to reset the learned value. */
+ * timing_scale stretches the delays of the capture sequence and of the finger
+ * probe, which sit right at the edge on the author's unit; a slower SPI
+ * controller loses sync there, and a capture fails (see gx_timing_capture_failed).
+ * The value is remembered so the next open starts at the timing this unit is
+ * known to need. It lives in fprintd's state directory (the only writable path
+ * under ProtectSystem=strict) and is device- not user-scoped. It holds the scale
+ * and a count of consecutive clean sessions. Delete the file to reset it.
+ *
+ * Earlier versions raised the scale on a failed TLS handshake. No scaled delay
+ * is on the handshake path, so that never helped it, and since a first
+ * handshake that fails and a retry that connects is common, every unit drifted
+ * to the cap and paid three times the capture delays for good. */
 #define GX_TIMING_FILE "/var/lib/fprint/.goodixtls-timing"
 
+/* After this many sessions in a row without a failed capture, the persisted
+ * scale steps back down by one notch. A unit that really needs the higher
+ * value fails a capture, climbs back and restarts the count, so probing costs
+ * one retried capture every few dozen sessions at most. */
+#define GX_TIMING_DECAY_AFTER 10
+
 static int
-gx_timing_load (void)
+gx_timing_load (int *clean)
 {
   g_autofree gchar *txt = NULL;
-  int v;
+  int v, c = 0;
 
+  *clean = 0;
   if (!g_file_get_contents (GX_TIMING_FILE, &txt, NULL, NULL))
     return 100;
-  v = atoi (txt);
-  return (v >= 100 && v <= 300) ? v : 100;   /* clamp; ignore a garbled file */
+  /* A lone scale is what older versions wrote, and they learned it from failed
+   * handshakes, which no scaled delay affects: start that unit over at 100. */
+  if (sscanf (txt, "%d %d", &v, &c) < 2 || v < 100 || v > 300)
+    return 100;                              /* also ignores a garbled file */
+  *clean = CLAMP (c, 0, GX_TIMING_DECAY_AFTER);
+  return v;
 }
 
 static void
-gx_timing_save (int scale)
+gx_timing_save (int scale, int clean)
 {
-  g_autofree gchar *txt = g_strdup_printf ("%d\n", scale);
+  g_autofree gchar *txt = g_strdup_printf ("%d %d\n", scale, clean);
 
   if (!g_file_set_contents (GX_TIMING_FILE, txt, -1, NULL))
     fp_warn ("could not persist timing scale to %s", GX_TIMING_FILE);
   else
     g_chmod (GX_TIMING_FILE, 0600);
+}
+
+/* A capture failed: the sensor lost sync inside the scaled delays. Loosen them
+ * for the rest of this open and persist the new value at once, so the next
+ * open starts there too. Capped so a dead sensor still gives up. */
+static void
+gx_timing_capture_failed (FpiDeviceGoodixTls *self)
+{
+  self->capture_failed = TRUE;
+  if (self->timing_scale >= 300)
+    return;
+  self->timing_scale = MIN (self->timing_scale + 50, 300);
+  self->timing_saved = self->timing_scale;
+  self->timing_clean = 0;
+  gx_timing_save (self->timing_saved, self->timing_clean);
+  fp_info ("capture failed; protocol timings loosened to %d%%",
+           self->timing_scale);
+}
+
+/* End of an open: count a clean session, and after enough of them in a row
+ * persist one notch lower for the next open. */
+static void
+gx_timing_session_end (FpiDeviceGoodixTls *self)
+{
+  if (self->capture_failed)
+    {
+      if (self->timing_clean)
+        {
+          self->timing_clean = 0;
+          gx_timing_save (self->timing_saved, self->timing_clean);
+        }
+      return;
+    }
+  if (self->timing_saved <= 100)
+    return;
+  if (++self->timing_clean >= GX_TIMING_DECAY_AFTER)
+    {
+      self->timing_saved = MAX (self->timing_saved - 50, 100);
+      self->timing_clean = 0;
+      fp_info ("timing scale held %d sessions; next open tries %d%%",
+               GX_TIMING_DECAY_AFTER, self->timing_saved);
+    }
+  gx_timing_save (self->timing_saved, self->timing_clean);
+}
+
+/* The unit's idle FDT level, remembered across opens like the timing scale.
+ *
+ * Calibration measures the idle level at the start of each operation, and a
+ * finger resting on the sensor then pulls it down: the floor lands below the
+ * finger, which is never detected again until it is lifted and the next
+ * operation recalibrates. With the last good idle level on file, the floor is
+ * right from the first probe of an open, and a measurement well below it — a
+ * finger, not drift — is refused. A HIGHER reading is always accepted, so a
+ * bad value on file corrects itself the next time the sensor is idle. */
+#define GX_FDT_FILE "/var/lib/fprint/.goodixtls-fdt"
+
+static int
+gx_fdt_load (void)
+{
+  g_autofree gchar *txt = NULL;
+  int v;
+
+  if (!g_file_get_contents (GX_FDT_FILE, &txt, NULL, NULL) ||
+      sscanf (txt, "%d", &v) != 1 || v <= 0 || v > 4095)
+    return 0;
+  return v;
+}
+
+static void
+gx_fdt_save (int idle)
+{
+  g_autofree gchar *txt = g_strdup_printf ("%d\n", idle);
+
+  if (!g_file_set_contents (GX_FDT_FILE, txt, -1, NULL))
+    fp_warn ("could not persist the idle level to %s", GX_FDT_FILE);
+  else
+    g_chmod (GX_FDT_FILE, 0600);
 }
 
 /* Establishes the TLS channel. This is the expensive step, about half a
@@ -955,6 +1064,12 @@ gx_tls_session (FpiDeviceGoodixTls *self)
 
   if (self->tls_up)
     return TRUE;
+  /* Give the first attempt the double reset a retry gets (this one, then the
+   * one in gx_upload_config_and_reqtls). Behind a single reset the first
+   * handshake failed in every session of a run, while retries connected;
+   * with the extra pulse half of the first attempts connected (3 of 6, against
+   * 0 of 7). A small sample, but a failed attempt costs 1.5 s and this 130 ms. */
+  gx_gpio_reset (self);
   for (att = 1; att <= 5 && !self->tls_up; att++)
     {
       GCancellable *c = fpi_device_get_cancellable (FP_DEVICE (self));
@@ -966,20 +1081,6 @@ gx_tls_session (FpiDeviceGoodixTls *self)
       if (gx_upload_config_and_reqtls (self) && gx_tls_handshake (self))
         break;
       gx_tls_teardown (self);
-
-      /* Self-healing on desync. The protocol delays are tuned to the author's
-       * unit and sit right at the edge; a different SPI controller can be
-       * slower and lose sync, which shows up here as a failed handshake. Each
-       * failure loosens every scaled delay for the next attempt and for the
-       * rest of this device's lifetime, so a flaky unit converges on timings
-       * that hold instead of failing at the author's values. Capped so a
-       * genuinely dead sensor still gives up rather than crawling. */
-      if (self->timing_scale < 300)
-        {
-          self->timing_scale = MIN (self->timing_scale + 50, 300);
-          fp_info ("handshake failed; loosening protocol timings to %d%%",
-                   self->timing_scale);
-        }
 
       /* A plain reset between attempts. Holding the reset line down for a
        * long time was tried and is actively counter-productive: recovery
@@ -993,15 +1094,6 @@ gx_tls_session (FpiDeviceGoodixTls *self)
       fp_warn ("no TLS session after %d attempts; if this persists the sensor "
                "needs a full recovery (long reset plus an spidev rebind)",
                att - 1);
-    }
-  else if (self->timing_scale > self->timing_saved)
-    {
-      /* Only ever raise the persisted value, and only on success: a scale
-       * reached while failing (a deep lock-up climbs to the cap and never
-       * connects) must not be written, or every unit would drift to 300%. */
-      gx_timing_save (self->timing_scale);
-      self->timing_saved = self->timing_scale;
-      fp_info ("learned timing scale %d%% persisted", self->timing_scale);
     }
   return self->tls_up;
 }
@@ -1103,17 +1195,47 @@ gx_session_start (FpiDeviceGoodixTls *self)
         }
     if (nb)
       {
+        int base[12], idle;
+
         for (k = 0; k < 12; k++)
-          self->fdt_base[k] = acc[k] / nb;
-        self->have_fdt = TRUE;
-        /* Derive the absolute floor from THIS unit's idle level instead of a
-         * fixed number. A finger only ever pulls the mean down, so the floor
-         * sits a fixed margin below idle; where idle actually is no longer
-         * matters, which is what makes detection work on a sensor other than
-         * the author's. */
-        self->fdt_abs = gx_fdt_mean (self->fdt_base) - GOODIX_FDT_ABS_MARGIN;
-        fp_info ("FDT auto-calibrated: idle mean=%d -> floor=%d (drop>%d)",
-                 gx_fdt_mean (self->fdt_base), self->fdt_abs, GOODIX_FDT_DROP);
+          base[k] = acc[k] / nb;
+        idle = gx_fdt_mean (base);
+
+        /* A finger, not the idle level: the background was taken with it down,
+         * or the reading sits well below the level this unit is known to idle
+         * at. Keep the previous baseline (or derive one from the known level)
+         * rather than calibrate onto the finger. */
+        if (self->fdt_known &&
+            (self->bg_dirty || idle < self->fdt_known - 2 * GOODIX_FDT_ABS_MARGIN))
+          {
+            if (!self->have_fdt)
+              {
+                for (k = 0; k < 12; k++)
+                  self->fdt_base[k] = self->fdt_known;
+                self->have_fdt = TRUE;
+              }
+            self->fdt_abs = self->fdt_known - GOODIX_FDT_ABS_MARGIN;
+            fp_info ("FDT reading %d looks like a finger (idle %d): floor kept "
+                     "at %d", idle, self->fdt_known, self->fdt_abs);
+          }
+        else
+          {
+            memcpy (self->fdt_base, base, sizeof base);
+            self->have_fdt = TRUE;
+            /* Derive the absolute floor from THIS unit's idle level instead of
+             * a fixed number. A finger only ever pulls the mean down, so the
+             * floor sits a fixed margin below idle; where idle actually is no
+             * longer matters, which is what makes detection work on a sensor
+             * other than the author's. */
+            self->fdt_abs = idle - GOODIX_FDT_ABS_MARGIN;
+            fp_info ("FDT auto-calibrated: idle mean=%d -> floor=%d (drop>%d)",
+                     idle, self->fdt_abs, GOODIX_FDT_DROP);
+            if (!self->bg_dirty && ABS (idle - self->fdt_known) >= 4)
+              {
+                gx_fdt_save (idle);
+                self->fdt_known = idle;
+              }
+          }
       }
   }
   return self->have_fdt;
@@ -1602,6 +1724,7 @@ gx_capture_thread (GTask *task, gpointer src, gpointer data, GCancellable *c)
 static void
 gx_finish_close (FpiDeviceGoodixTls *self)
 {
+  gx_timing_session_end (self);
   g_clear_handle_id (&self->poll_id, g_source_remove);
   gx_tls_teardown (self);
   if (self->spi_fd >= 0)
@@ -2106,10 +2229,14 @@ gx_dev_open (FpDevice *dev)
     ioctl (self->spi_fd, SPI_IOC_WR_BITS_PER_WORD, &bits);
     ioctl (self->spi_fd, SPI_IOC_WR_MAX_SPEED_HZ, &speed);
   }
-  /* Fallbacks until the first calibration measures the unit: fdt_abs is the
-   * hard-coded floor, timing_scale is nominal. Both then adapt per unit. */
-  self->fdt_abs = GOODIX_FDT_ABS;
-  self->timing_scale = gx_timing_load ();
+  /* Start from what this unit is known to need; without a file, fdt_abs is the
+   * hard-coded floor and timing_scale nominal, and both adapt per unit. */
+  self->fdt_known = gx_fdt_load ();
+  self->fdt_abs = self->fdt_known ? self->fdt_known - GOODIX_FDT_ABS_MARGIN :
+                  GOODIX_FDT_ABS;
+  self->have_fdt = FALSE;
+  self->capture_failed = FALSE;
+  self->timing_scale = gx_timing_load (&self->timing_clean);
   self->timing_saved = self->timing_scale;
   if (self->timing_scale != 100)
     fp_info ("starting from learned timing scale %d%%", self->timing_scale);
