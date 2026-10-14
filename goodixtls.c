@@ -243,12 +243,14 @@ gx_send_plain_drain (FpiDeviceGoodixTls *self, const guint8 *body, gsize n)
 /*  Transport glue: TLS records travel inside 0xB0 SPI frames          */
 /* ------------------------------------------------------------------ */
 
+#define GX_RECORD_GAP_US 5000
+
 static int
 gx_bio_send (gpointer ctx, const guint8 *b, gsize l)
 {
   FpiDeviceGoodixTls *self = ctx;
 
-  gsize off = 0;
+  gsize off = 0, prev = 0;
 
   /* One TLS record per 0xB0 frame. OpenSSL batches several records into a
    * single write — the ServerHello group comes out as one 121-byte call — but
@@ -261,6 +263,16 @@ gx_bio_send (gpointer ctx, const guint8 *b, gsize l)
 
       if (off + rec > l)
         break;                        /* partial record: should not happen */
+      /* Space out consecutive handshake records (ServerHello, key exchange
+       * hint, ServerHelloDone). Written back to back, within a millisecond,
+       * the sensor missed the flight about half the time and never answered:
+       * first handshakes connected 9 times in 25. With 5 ms between them, 19
+       * in 20 (the Windows driver also paces its SPI writes). The final
+       * ChangeCipherSpec + Finished pair must NOT be split: spaced, the
+       * handshake completed but the sensor never delivered an image. */
+      if (off > 0 && b[off] == 0x16 && b[prev] == 0x16)
+        g_usleep (GX_RECORD_GAP_US);
+      prev = off;
       if (!gx_write_frame (self, GOODIX_PKT_TLS, b + off, rec))
         return -1;
       off += rec;
