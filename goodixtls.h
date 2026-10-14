@@ -25,30 +25,30 @@
 #include "drivers_api.h"
 
 /* Sensor geometry, cross-checked against the vendor driver's own logs. */
-#define GOODIX_IMG_WIDTH   132
-#define GOODIX_IMG_HEIGHT  112
-#define GOODIX_IMG_PIXELS  (GOODIX_IMG_WIDTH * GOODIX_IMG_HEIGHT)
+#define GOODIX_IMG_WIDTH 132
+#define GOODIX_IMG_HEIGHT 112
+#define GOODIX_IMG_PIXELS (GOODIX_IMG_WIDTH * GOODIX_IMG_HEIGHT)
 
 /* SPI framing: 0xA0 is a cleartext message, 0xB0 carries a TLS record. */
-#define GOODIX_PKT_PLAIN   0xA0
-#define GOODIX_PKT_TLS     0xB0
+#define GOODIX_PKT_PLAIN 0xA0
+#define GOODIX_PKT_TLS 0xB0
 
 /*
  * Command table. The first body byte is (cmd0 << 4) | (cmd1 << 1), with
  * cmd0 being: 0x2 image, 0x3 finger detect, 0x5 navigation, 0x8 register,
  * 0x9 chip, 0xA MCU, 0xD TLS connection, 0xF firmware update / memory.
  */
-#define GOODIX_CMD_IMAGE       0x20
-#define GOODIX_CMD_FDT_DOWN    0x36
-#define GOODIX_CMD_NAV         0x50
-#define GOODIX_CMD_REG         0x82
+#define GOODIX_CMD_IMAGE 0x20
+#define GOODIX_CMD_FDT_DOWN 0x36
+#define GOODIX_CMD_NAV 0x50
+#define GOODIX_CMD_REG 0x82
 #define GOODIX_CMD_ENABLE_CHIP 0x96
-#define GOODIX_CMD_MCU_STATE   0xAE
-#define GOODIX_CMD_UPLOAD_CFG  0x90
+#define GOODIX_CMD_MCU_STATE 0xAE
+#define GOODIX_CMD_UPLOAD_CFG 0x90
 #define GOODIX_CMD_REQUEST_TLS 0xD0
-#define GOODIX_CMD_TLS_OK      0xD4
-#define GOODIX_CMD_FW_VERSION  0xA8
-#define GOODIX_CMD_MEM_READ    0xF2   /* arbitrary memory read: [addr32][len32] */
+#define GOODIX_CMD_TLS_OK 0xD4
+#define GOODIX_CMD_FW_VERSION 0xA8
+#define GOODIX_CMD_MEM_READ 0xF2      /* arbitrary memory read: [addr32][len32] */
 
 /*
  * The pre-shared key is a 48-byte PMK that the sensor decrypts into its own RAM
@@ -61,8 +61,8 @@
  * Note the roles are reversed from what one might expect: the SENSOR is the TLS
  * client and the host is the server.
  */
-#define GOODIX_PSK_ADDR   0x20007f0c
-#define GOODIX_PSK_LEN    48
+#define GOODIX_PSK_ADDR 0x20007f0c
+#define GOODIX_PSK_LEN 48
 #define GOODIX_TLS_IDENTITY "Client_identity"
 
 /* Finger detection reads twelve 16-bit values, which a finger pulls DOWN.
@@ -91,7 +91,7 @@
  * unit whose idle sits elsewhere, a fixed 340 was the portability bug behind
  * the "huge amount of failed attempts" report: a sensor idling below it reads
  * as a finger on every poll and captures noise. See self->fdt_abs. */
-#define GOODIX_FDT_ABS  340
+#define GOODIX_FDT_ABS 340
 
 /* How far below the measured idle mean the per-unit absolute floor sits.
  * Chosen so idle≈364 − margin reproduces the previous 340 on the author's

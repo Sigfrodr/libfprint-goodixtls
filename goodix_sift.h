@@ -41,12 +41,12 @@
 
 #include <glib.h>
 
-#define GX_SIFT_CELLS   4
-#define GX_SIFT_BINS    8
-#define GX_SIFT_DIM     (GX_SIFT_CELLS * GX_SIFT_CELLS * GX_SIFT_BINS)  /* 128 */
+#define GX_SIFT_CELLS 4
+#define GX_SIFT_BINS 8
+#define GX_SIFT_DIM (GX_SIFT_CELLS * GX_SIFT_CELLS * GX_SIFT_BINS)      /* 128 */
 
 #ifndef GX_SIFT_PATCH
-#define GX_SIFT_PATCH   20      /* descriptor window side, in pixels */
+#define GX_SIFT_PATCH 20        /* descriptor window side, in pixels */
 #endif
 
 #ifndef GX_SIFT_MAX_PTS
@@ -66,31 +66,38 @@ typedef struct
 
 typedef struct
 {
-  guint         n;
-  GxSiftPoint  *pts;
+  guint        n;
+  GxSiftPoint *pts;
 } GxSiftFeatures;
 
 /* Extracts keypoints and descriptors from a greyscale image. Pixel values may
  * be on any scale; only the structure matters. */
-GxSiftFeatures *gx_sift_extract (const double *img, int w, int h);
+GxSiftFeatures *gx_sift_extract (const double *img,
+                                 int           w,
+                                 int           h);
 
 void gx_sift_free (GxSiftFeatures *f);
 
 /* Number of geometrically consistent matches between two feature sets. This is
  * the similarity score: above a threshold, both come from the same finger. */
-int gx_sift_match (const GxSiftFeatures *a, const GxSiftFeatures *b);
+int gx_sift_match (const GxSiftFeatures *a,
+                   const GxSiftFeatures *b);
 
 /* Same, but also flags in @mask (sized b->n) the points of @b that matched
  * consistently. Lets the caller accumulate evidence across several template
  * views instead of keeping only the best view's score. */
-int gx_sift_match_mask (const GxSiftFeatures *a, const GxSiftFeatures *b,
-                        guint8 *mask);
+int gx_sift_match_mask (const GxSiftFeatures *a,
+                        const GxSiftFeatures *b,
+                        guint8               *mask);
 
 /* Same, and also reports the (b - a) translation of the best consistent
  * cluster. This is what allows template views to be registered into a common
  * frame. */
-int gx_sift_match_xform (const GxSiftFeatures *a, const GxSiftFeatures *b,
-                         guint8 *mask, int *out_tx, int *out_ty);
+int gx_sift_match_xform (const GxSiftFeatures *a,
+                         const GxSiftFeatures *b,
+                         guint8               *mask,
+                         int                  *out_tx,
+                         int                  *out_ty);
 
 /*
  * Incremental registration, used to guide enrolment in real time.
@@ -113,12 +120,20 @@ void          gx_sift_island_free (GxSiftIsland *island);
  * view does not overlap the island enough to be placed safely, in which case
  * the caller should ask for a press closer to the previous ones.
  * @out_dx and @out_dy give the view's position in the island's frame. */
-gboolean gx_sift_island_add (GxSiftIsland *island, const GxSiftFeatures *v,
-                             int *out_dx, int *out_dy, int *out_score);
+gboolean gx_sift_island_add (GxSiftIsland         *island,
+                             const GxSiftFeatures *v,
+                             int                  *out_dx,
+                             int                  *out_dy,
+                             int                  *out_score);
 
-void gx_sift_island_extent (GxSiftIsland *island, int *x0, int *y0,
-                            int *x1, int *y1, guint *npts);
+void gx_sift_island_extent (GxSiftIsland *island,
+                            int          *x0,
+                            int          *y0,
+                            int          *x1,
+                            int          *y1,
+                            guint        *npts);
 
 /* Compact serialisation, for storage inside an FpPrint. */
 GByteArray *gx_sift_serialize (const GxSiftFeatures *f);
-GxSiftFeatures *gx_sift_deserialize (const guint8 *data, gsize len);
+GxSiftFeatures *gx_sift_deserialize (const guint8 *data,
+                                     gsize         len);

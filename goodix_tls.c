@@ -31,34 +31,34 @@
 #include "goodix_tls.h"
 
 /* TLS_PSK_WITH_AES_128_CBC_SHA256 key material. */
-#define MAC_KEY_LEN  32
-#define ENC_KEY_LEN  16
-#define IV_LEN       16
-#define MAC_LEN      32
+#define MAC_KEY_LEN 32
+#define ENC_KEY_LEN 16
+#define IV_LEN 16
+#define MAC_LEN 32
 #define KEY_BLOCK_LEN (2 * MAC_KEY_LEN + 2 * ENC_KEY_LEN)
 
 struct _GxTls
 {
-  SSL_CTX   *ctx;
-  SSL       *ssl;
+  SSL_CTX    *ctx;
+  SSL        *ssl;
   BIO_METHOD *biom;
 
-  GxTlsSend  send;
-  GxTlsRecv  recv;
-  gpointer   user;
+  GxTlsSend   send;
+  GxTlsRecv   recv;
+  gpointer    user;
 
-  guint8     psk[64];
-  gsize      psk_len;
-  gchar     *identity;
+  guint8      psk[64];
+  gsize       psk_len;
+  gchar      *identity;
 
   /* Derived once the handshake completes. The sensor is the client, so its
    * records are protected with the client_write_* material. */
-  guint8     client_mac[MAC_KEY_LEN];
-  guint8     client_key[ENC_KEY_LEN];
-  guint8     server_mac[MAC_KEY_LEN];
-  guint8     server_key[ENC_KEY_LEN];
-  guint64    read_seq;
-  gboolean   keys_ready;
+  guint8   client_mac[MAC_KEY_LEN];
+  guint8   client_key[ENC_KEY_LEN];
+  guint8   server_mac[MAC_KEY_LEN];
+  guint8   server_key[ENC_KEY_LEN];
+  guint64  read_seq;
+  gboolean keys_ready;
 };
 
 /* ------------------------------------------------------------------ */
