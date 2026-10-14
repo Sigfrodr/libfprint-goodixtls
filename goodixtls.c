@@ -83,6 +83,8 @@ struct _FpiDeviceGoodixTls
   int           fdt_abs;     /* per-unit absolute floor, derived from baseline */
   int           timing_scale;/* protocol-delay multiplier in %, grows on desync */
   int           timing_saved;/* last value persisted to disk, to avoid rewrites */
+  gboolean      worker_active;/* a work thread is running; close must wait */
+  gboolean      close_pending;/* close was asked while a worker ran; do it after */
   gboolean      bg_dirty;    /* background taken with a finger down */
 };
 
@@ -1523,12 +1525,43 @@ gx_capture_thread (GTask *task, gpointer src, gpointer data, GCancellable *c)
   g_task_return_boolean (task, TRUE);
 }
 
+/* The actual teardown, shared between an immediate close and one deferred until
+ * a worker thread has finished. Safe to call only when no work thread is
+ * touching the state below: from gx_dev_close when no worker runs, or from a
+ * completion callback, which the main loop invokes only AFTER the thread has
+ * returned. */
+static void
+gx_finish_close (FpiDeviceGoodixTls *self)
+{
+  g_clear_handle_id (&self->poll_id, g_source_remove);
+  gx_tls_teardown (self);
+  if (self->spi_fd >= 0)
+    {
+      close (self->spi_fd);
+      self->spi_fd = -1;
+    }
+  g_clear_pointer (&self->bg_frame, g_free);
+  self->close_pending = FALSE;
+  fpi_device_close_complete (FP_DEVICE (self), NULL);
+}
+
 static void
 gx_session_done (GObject *src, GAsyncResult *res, gpointer user_data)
 {
   GxWork *w = g_task_get_task_data (G_TASK (res));
   FpiDeviceGoodixTls *self = FPI_DEVICE_GOODIXTLS (w->dev);
 
+  self->worker_active = FALSE;
+  if (self->close_pending)
+    {
+      /* close was requested while this thread ran; the thread is done now, so
+       * the deferred teardown is safe. Fail the SSM first to unwind the
+       * operation cleanly, then complete the close. */
+      fpi_ssm_mark_failed (w->ssm, g_error_new (G_IO_ERROR,
+        G_IO_ERROR_CANCELLED, "device closing"));
+      gx_finish_close (self);
+      return;
+    }
   if (!w->ok)
     {
       fpi_ssm_mark_failed (w->ssm, fpi_device_error_new_msg (
@@ -1556,6 +1589,7 @@ gx_run_async (FpiSsm *ssm, FpDevice *dev, GTaskThreadFunc fn,
 
   w->ssm = ssm;
   w->dev = dev;
+  FPI_DEVICE_GOODIXTLS (dev)->worker_active = TRUE;
   g_task_set_task_data (task, w, (GDestroyNotify) gx_work_free);
   g_task_run_in_thread (task, fn);
   g_object_unref (task);
@@ -1679,6 +1713,16 @@ gx_capture_done (GObject *src, GAsyncResult *res, gpointer user_data)
   FpiSsm *ssm = w->ssm;
   FpDevice *dev = w->dev;
   FpiDeviceGoodixTls *self = FPI_DEVICE_GOODIXTLS (dev);
+
+  self->worker_active = FALSE;
+  if (self->close_pending)
+    {
+      fpi_ssm_mark_failed (ssm, g_error_new (G_IO_ERROR,
+        G_IO_ERROR_CANCELLED, "device closing"));
+      gx_finish_close (self);
+      return;                       /* w->feat freed by gx_work_free */
+    }
+
   GxTask *t = fpi_ssm_get_data (ssm);
   GxSiftFeatures *f = g_steal_pointer (&w->feat);
 
@@ -1986,17 +2030,16 @@ gx_dev_close (FpDevice *dev)
 {
   FpiDeviceGoodixTls *self = FPI_DEVICE_GOODIXTLS (dev);
 
-  /* Cancel a pending finger-detection poll before tearing state down: it holds
-   * the SSM as user data and would fire on freed state otherwise. */
-  g_clear_handle_id (&self->poll_id, g_source_remove);
-  gx_tls_teardown (self);
-  if (self->spi_fd >= 0)
+  /* If a work thread is still running it is using spi_fd / tls / bg_frame;
+   * freeing them here would pull the ground out from under it — the shutdown
+   * segfault. Defer the whole teardown to the thread's completion callback,
+   * which the main loop runs only once the thread has returned. */
+  if (self->worker_active)
     {
-      close (self->spi_fd);
-      self->spi_fd = -1;
+      self->close_pending = TRUE;
+      return;
     }
-  g_clear_pointer (&self->bg_frame, g_free);
-  fpi_device_close_complete (dev, NULL);
+  gx_finish_close (self);
 }
 
 /* --- verification completion --------------------------------------- */
