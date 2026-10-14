@@ -54,29 +54,43 @@ typedef struct _GxTls GxTls;
 
 /* Transport hooks: both must block until they have moved some bytes, and
  * return the count, or a negative value on failure. */
-typedef int (*GxTlsSend) (gpointer user, const guint8 *buf, gsize len);
-typedef int (*GxTlsRecv) (gpointer user, guint8 *buf, gsize cap);
+typedef int (*GxTlsSend) (gpointer      user,
+                          const guint8 *buf,
+                          gsize         len);
+typedef int (*GxTlsRecv) (gpointer user,
+                          guint8  *buf,
+                          gsize    cap);
 
-GxTls *gx_tls_new (const guint8 *psk, gsize psk_len, const gchar *identity,
-                   GxTlsSend send, GxTlsRecv recv, gpointer user);
+GxTls *gx_tls_new (const guint8 *psk,
+                   gsize         psk_len,
+                   const gchar  *identity,
+                   GxTlsSend     send,
+                   GxTlsRecv     recv,
+                   gpointer      user);
 void   gx_tls_free (GxTls *tls);
 
 /* Runs the server side of the handshake and derives the connection keys.
  * Returns FALSE and sets @error on failure. */
-gboolean gx_tls_handshake_run (GxTls *tls, GError **error);
+gboolean gx_tls_handshake_run (GxTls   *tls,
+                               GError **error);
 
 /* Name of the negotiated ciphersuite, for logging. */
 const gchar *gx_tls_ciphersuite (GxTls *tls);
 
 /* Sends application data. Small commands only; goes through OpenSSL. */
-gboolean gx_tls_write (GxTls *tls, const guint8 *buf, gsize len);
+gboolean gx_tls_write (GxTls        *tls,
+                       const guint8 *buf,
+                       gsize         len);
 
 /* Reads ONE application-data record and decrypts it into @out.
  *
  * This deliberately bypasses OpenSSL, which would reject the oversized image
  * record. @raw is the record exactly as it came off the wire, header included.
  * Returns the plaintext length, or -1 on failure. */
-gssize gx_tls_decrypt_record (GxTls *tls, const guint8 *raw, gsize raw_len,
-                              guint8 *out, gsize out_cap);
+gssize gx_tls_decrypt_record (GxTls        *tls,
+                              const guint8 *raw,
+                              gsize         raw_len,
+                              guint8       *out,
+                              gsize         out_cap);
 
 void gx_tls_close (GxTls *tls);

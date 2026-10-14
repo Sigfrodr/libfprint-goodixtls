@@ -29,12 +29,12 @@
 #include "goodix_sift.h"
 
 #ifndef RATIO
-#define RATIO       0.90        /* Lowe's ratio test */
+#define RATIO 0.90              /* Lowe's ratio test */
 #endif
 #ifndef GEO_TOL
-#define GEO_TOL     6.0         /* geometric consistency tolerance, in pixels */
+#define GEO_TOL 6.0             /* geometric consistency tolerance, in pixels */
 #endif
-#define MIN_PAIRS   3
+#define MIN_PAIRS 3
 
 /* ------------------------------------------------------------------ */
 /*  Helpers                                                            */
@@ -160,10 +160,14 @@ gx_sift_extract (const double *img, int w, int h)
 
       for (i = 0; i < n; i++)
         if (sal[i] > bv)
-          { bv = sal[i]; best = i; }
+          {
+            bv = sal[i];
+            best = i;
+          }
       if (best < 0)
         break;
-      x = best % w; y = best / w;
+      x = best % w;
+      y = best / w;
       f->pts[f->n].x = x;
       f->pts[f->n].y = y;
       f->n++;
@@ -200,20 +204,26 @@ gx_sift_extract (const double *img, int w, int h)
               continue;
             ang = atan2 (gy[yy * w + xx], gx[yy * w + xx]) - a;
             g = fmod (ang, 2 * M_PI);
-            if (g < 0) g += 2 * M_PI;
+            if (g < 0)
+              g += 2 * M_PI;
             b = (int) (g / (2 * M_PI) * GX_SIFT_BINS) % GX_SIFT_BINS;
             hist[(cy * GX_SIFT_CELLS + cx) * GX_SIFT_BINS + b] += mag[yy * w + xx];
           }
 
       /* L2 normalise, clip at 0.2, renormalise, square root (RootSIFT). */
-      for (i = 0; i < GX_SIFT_DIM; i++) norm += hist[i] * hist[i];
+      for (i = 0; i < GX_SIFT_DIM; i++)
+        norm += hist[i] * hist[i];
       norm = sqrt (norm);
       if (norm < 1e-9)
-        { memset (f->pts[k].desc, 0, GX_SIFT_DIM); continue; }
+        {
+          memset (f->pts[k].desc, 0, GX_SIFT_DIM);
+          continue;
+        }
       for (i = 0; i < GX_SIFT_DIM; i++)
         hist[i] = MIN (hist[i] / norm, 0.2);
       norm = 0.0;
-      for (i = 0; i < GX_SIFT_DIM; i++) norm += hist[i] * hist[i];
+      for (i = 0; i < GX_SIFT_DIM; i++)
+        norm += hist[i] * hist[i];
       norm = sqrt (norm) + 1e-9;
       for (i = 0; i < GX_SIFT_DIM; i++)
         {
@@ -277,11 +287,23 @@ gx_sift_match_xform (const GxSiftFeatures *A, const GxSiftFeatures *B,
       for (j = 0; j < (int) B->n; j++)
         {
           double d = desc_dist2 (A->pts[i].desc, B->pts[j].desc);
-          if (d < d1) { d2 = d1; d1 = d; jb = j; }
-          else if (d < d2) d2 = d;
+          if (d < d1)
+            {
+              d2 = d1;
+              d1 = d;
+              jb = j;
+            }
+          else if (d < d2)
+            {
+              d2 = d;
+            }
         }
       if (jb >= 0 && d1 < RATIO * RATIO * d2)
-        { pi[np] = i; pj[np] = jb; np++; }
+        {
+          pi[np] = i;
+          pj[np] = jb;
+          np++;
+        }
     }
   if (np < MIN_PAIRS)
     return 0;
@@ -303,22 +325,30 @@ gx_sift_match_xform (const GxSiftFeatures *A, const GxSiftFeatures *B,
             cnt++;
         }
       if (cnt > best)
-        { best = cnt; bt_x = tx; bt_y = ty; }
+        {
+          best = cnt;
+          bt_x = tx;
+          bt_y = ty;
+        }
     }
 
-  if (out_tx) *out_tx = (int) bt_x;
-  if (out_ty) *out_ty = (int) bt_y;
+  if (out_tx)
+    *out_tx = (int) bt_x;
+  if (out_ty)
+    *out_ty = (int) bt_y;
 
   /* Flag the points of B belonging to the best cluster, so the caller can
    * merge evidence across several template views. */
   if (mask && best >= MIN_PAIRS)
-    for (j = 0; j < np; j++)
-      {
-        double ex = B->pts[pj[j]].x - A->pts[pi[j]].x - bt_x;
-        double ey = B->pts[pj[j]].y - A->pts[pi[j]].y - bt_y;
-        if (ex * ex + ey * ey <= GEO_TOL * GEO_TOL)
-          mask[pj[j]] = 1;
-      }
+    {
+      for (j = 0; j < np; j++)
+        {
+          double ex = B->pts[pj[j]].x - A->pts[pi[j]].x - bt_x;
+          double ey = B->pts[pj[j]].y - A->pts[pi[j]].y - bt_y;
+          if (ex * ex + ey * ey <= GEO_TOL * GEO_TOL)
+            mask[pj[j]] = 1;
+        }
+    }
   return best;
 }
 
@@ -367,7 +397,8 @@ gx_sift_deserialize (const guint8 *data, gsize len)
 
   if (len < sizeof (guint32))
     return NULL;
-  memcpy (&n, p, sizeof n); p += sizeof n;
+  memcpy (&n, p, sizeof n);
+  p += sizeof n;
   need = sizeof (guint32) + (gsize) n * (2 * sizeof (gint16) + GX_SIFT_DIM);
   if (n > 4096 || len < need)
     return NULL;
@@ -377,9 +408,12 @@ gx_sift_deserialize (const guint8 *data, gsize len)
   f->pts = g_new0 (GxSiftPoint, n ? n : 1);
   for (i = 0; i < n; i++)
     {
-      memcpy (&f->pts[i].x, p, sizeof (gint16)); p += sizeof (gint16);
-      memcpy (&f->pts[i].y, p, sizeof (gint16)); p += sizeof (gint16);
-      memcpy (f->pts[i].desc, p, GX_SIFT_DIM);   p += GX_SIFT_DIM;
+      memcpy (&f->pts[i].x, p, sizeof (gint16));
+      p += sizeof (gint16);
+      memcpy (&f->pts[i].y, p, sizeof (gint16));
+      p += sizeof (gint16);
+      memcpy (f->pts[i].desc, p, GX_SIFT_DIM);
+      p += GX_SIFT_DIM;
     }
   return f;
 }
@@ -393,9 +427,9 @@ gx_sift_deserialize (const guint8 *data, gsize len)
  * offset. Views that cannot be attached stay outside the island — that is
  * intended, an enrolment may legitimately cover disjoint areas. */
 
-#define MERGE_MIN_PAIRS  6   /* demanding: a misplacement would corrupt the
+#define MERGE_MIN_PAIRS 6    /* demanding: a misplacement would corrupt the
                                 whole island */
-#define MERGE_DEDUP_PX   3   /* closer than this in the common frame means the
+#define MERGE_DEDUP_PX 3     /* closer than this in the common frame means the
                                 same physical point */
 
 struct _GxSiftIsland
@@ -467,8 +501,10 @@ island_bounds (GxSiftIsland *i)
   for (k = 1; k < i->pts->len; k++)
     {
       const GxSiftPoint *p = &g_array_index (i->pts, GxSiftPoint, k);
-      i->x0 = MIN (i->x0, p->x); i->x1 = MAX (i->x1, p->x);
-      i->y0 = MIN (i->y0, p->y); i->y1 = MAX (i->y1, p->y);
+      i->x0 = MIN (i->x0, p->x);
+      i->x1 = MAX (i->x1, p->x);
+      i->y0 = MIN (i->y0, p->y);
+      i->y1 = MAX (i->y1, p->y);
     }
 }
 
@@ -487,23 +523,29 @@ gx_sift_island_add (GxSiftIsland *isl, const GxSiftFeatures *v,
       merge_points (isl->pts, v, 0, 0);
       isl->empty = FALSE;
       island_bounds (isl);
-      if (out_dx) *out_dx = 0;
-      if (out_dy) *out_dy = 0;
-      if (out_score) *out_score = (int) v->n;
+      if (out_dx)
+        *out_dx = 0;
+      if (out_dy)
+        *out_dy = 0;
+      if (out_score)
+        *out_score = (int) v->n;
       return TRUE;
     }
 
   cur.n = isl->pts->len;
   cur.pts = (GxSiftPoint *) isl->pts->data;
   sc = gx_sift_match_xform (&cur, v, NULL, &tx, &ty);
-  if (out_score) *out_score = sc;
+  if (out_score)
+    *out_score = sc;
   if (sc < MERGE_MIN_PAIRS)
     return FALSE;                 /* no usable overlap */
 
   merge_points (isl->pts, v, -tx, -ty);
   island_bounds (isl);
-  if (out_dx) *out_dx = -tx;
-  if (out_dy) *out_dy = -ty;
+  if (out_dx)
+    *out_dx = -tx;
+  if (out_dy)
+    *out_dy = -ty;
   return TRUE;
 }
 
@@ -513,9 +555,14 @@ gx_sift_island_extent (GxSiftIsland *i, int *x0, int *y0, int *x1, int *y1,
 {
   if (!i)
     return;
-  if (x0) *x0 = i->x0;
-  if (y0) *y0 = i->y0;
-  if (x1) *x1 = i->x1;
-  if (y1) *y1 = i->y1;
-  if (npts) *npts = i->pts->len;
+  if (x0)
+    *x0 = i->x0;
+  if (y0)
+    *y0 = i->y0;
+  if (x1)
+    *x1 = i->x1;
+  if (y1)
+    *y1 = i->y1;
+  if (npts)
+    *npts = i->pts->len;
 }
