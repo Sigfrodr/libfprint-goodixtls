@@ -113,6 +113,32 @@ It isn't self-contained — you build it against that driver's sources (see the
 header) — but it shows the pattern. Measured on a GXFP51A0 it put the real matcher
 at EER ≈ 4.7 % where NBIS on the same 80×64 captures was 50 % (chance).
 
+If your matcher decides on the whole enrolled gallery rather than its best single
+view, also export the optional `fpeval_score_gallery()`; the harness then uses it
+in place of the best-of-gallery rule.
+
+## This driver's matcher (GXFP5187)
+
+[`plugin/goodix_rootsift.c`](plugin/goodix_rootsift.c) wraps `goodix_sift.c`, the
+matcher the driver ships, including its view fusion (`fpeval_score_gallery`). Its
+decision threshold is 15. Verify retries and adapted views are left out, so the
+FRR it reports is a pessimistic bound.
+
+[`collect-goodix.sh`](collect-goodix.sh) does the whole run on a GXFP5187: it
+enables the driver's capture dump, enrols each test finger twice with
+`fprintd-enroll` (about 60 captures: a 30-view gallery like the driver's, plus
+held-out probes), deletes each test enrolment again, converts the dumps with
+[`goodix_dump.py`](goodix_dump.py) (the driver's own preprocessing and
+no-finger rejection), builds the plug-in and runs the harness with `--enroll 30`:
+
+```
+./collect-goodix.sh ~/fp-eval-goodix left-index-finger left-middle-finger \
+                    right-middle-finger right-ring-finger
+```
+
+Use fingers you do not unlock with; the script refuses one that is enrolled. The
+captures stay in that directory; only the printed report is meant to be shared.
+
 ## Reading the result
 
 ```
