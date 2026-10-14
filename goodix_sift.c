@@ -92,20 +92,20 @@ GxSiftFeatures *
 gx_sift_extract (const double *img, int w, int h)
 {
   int n = w * h, i, x, y, k;
-  g_autofree double *gx = g_malloc (sizeof (double) * n);
-  g_autofree double *gy = g_malloc (sizeof (double) * n);
-  g_autofree double *vx = g_malloc (sizeof (double) * n);
-  g_autofree double *vy = g_malloc (sizeof (double) * n);
-  g_autofree double *smooth_x = g_malloc (sizeof (double) * n);
-  g_autofree double *smooth_y = g_malloc (sizeof (double) * n);
-  g_autofree double *mag = g_malloc (sizeof (double) * n);
-  g_autofree double *magm = g_malloc (sizeof (double) * n);
-  g_autofree double *theta = g_malloc (sizeof (double) * n);
-  g_autofree double *c2 = g_malloc (sizeof (double) * n);
-  g_autofree double *s2 = g_malloc (sizeof (double) * n);
-  g_autofree double *c2m = g_malloc (sizeof (double) * n);
-  g_autofree double *s2m = g_malloc (sizeof (double) * n);
-  g_autofree double *sal = g_malloc (sizeof (double) * n);
+  g_autofree double *gx = g_malloc0 (sizeof (double) * n);
+  g_autofree double *gy = g_malloc0 (sizeof (double) * n);
+  g_autofree double *vx = g_malloc0 (sizeof (double) * n);
+  g_autofree double *vy = g_malloc0 (sizeof (double) * n);
+  g_autofree double *smooth_x = g_malloc0 (sizeof (double) * n);
+  g_autofree double *smooth_y = g_malloc0 (sizeof (double) * n);
+  g_autofree double *mag = g_malloc0 (sizeof (double) * n);
+  g_autofree double *magm = g_malloc0 (sizeof (double) * n);
+  g_autofree double *theta = g_malloc0 (sizeof (double) * n);
+  g_autofree double *c2 = g_malloc0 (sizeof (double) * n);
+  g_autofree double *s2 = g_malloc0 (sizeof (double) * n);
+  g_autofree double *c2m = g_malloc0 (sizeof (double) * n);
+  g_autofree double *s2m = g_malloc0 (sizeof (double) * n);
+  g_autofree double *sal = g_malloc0 (sizeof (double) * n);
   GxSiftFeatures *f;
 
   gradients (img, gx, gy, w, h);
