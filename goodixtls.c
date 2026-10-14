@@ -1100,6 +1100,46 @@ gx_tls_session (FpiDeviceGoodixTls *self)
 /* How long to wait for the finger to be lifted before taking the background. */
 #define GX_BG_WAIT_MS 2000
 
+/* The last clean background, kept so an operation that starts with the finger
+ * already down need not wait for it to be lifted (the Windows driver never
+ * asks). Measured over 20 minutes and a dozen sessions, a background from
+ * another session scored the same as a fresh one (median 84 against 81, none
+ * near the threshold): between sessions the background moves by about 5,
+ * against a finger signal of about 160. It holds no fingerprint — it is only
+ * ever taken with the finger lifted — and is used only while recent, since
+ * drift over hours (temperature) was not measured. */
+#define GX_BG_FILE "/var/lib/fprint/.goodixtls-bg"
+#define GX_BG_MAX_AGE_S (2 * 3600)
+
+static gboolean
+gx_bg_load (guint16 *bg, int *age_s)
+{
+  g_autofree gchar *data = NULL;
+  gsize len = 0;
+  GStatBuf st;
+
+  if (g_stat (GX_BG_FILE, &st) != 0)
+    return FALSE;
+  *age_s = (int) (time (NULL) - st.st_mtime);
+  if (*age_s < 0 || *age_s > GX_BG_MAX_AGE_S)
+    return FALSE;
+  if (!g_file_get_contents (GX_BG_FILE, &data, &len, NULL) ||
+      len != sizeof (guint16) * GOODIX_IMG_PIXELS)
+    return FALSE;
+  memcpy (bg, data, len);
+  return TRUE;
+}
+
+static void
+gx_bg_save (const guint16 *bg)
+{
+  if (!g_file_set_contents (GX_BG_FILE, (const gchar *) bg,
+                            sizeof (guint16) * GOODIX_IMG_PIXELS, NULL))
+    fp_warn ("could not save the background to %s", GX_BG_FILE);
+  else
+    g_chmod (GX_BG_FILE, 0600);
+}
+
 static gboolean
 gx_session_start (FpiDeviceGoodixTls *self)
 {
@@ -1126,11 +1166,23 @@ gx_session_start (FpiDeviceGoodixTls *self)
     self->bg_frame = g_malloc (sizeof (guint16) * GOODIX_IMG_PIXELS);
 
   {
-    int cur[12], waited = 0;
-    gboolean timeout = FALSE;
+    int cur[12], waited = 0, age = 0;
+    gboolean timeout = FALSE, reused = FALSE;
     gint64 t0 = g_get_monotonic_time ();
 
-    for (;;)
+    /* Finger already down and a recent clean background on file: use it
+     * rather than make the user lift. Only with a known idle level, so that
+     * "finger down" is judged against this unit and not the fixed default. */
+    if (self->fdt_known && gx_fdt_probe (self, cur) == 0 &&
+        gx_fdt_mean (cur) < self->fdt_abs &&
+        gx_bg_load (self->bg_frame, &age))
+      {
+        fp_info ("finger already down: using the background saved %d s ago",
+                 age);
+        reused = TRUE;
+      }
+
+    while (!reused)
       {
         /* Wait for the finger to be lifted BEFORE spending a capture on the
         * background, not after. Probing costs about 33 ms, a background
@@ -1159,7 +1211,10 @@ gx_session_start (FpiDeviceGoodixTls *self)
          * runs and end up baked into the background. Check once more, and
          * redo it if that happened. */
         if (gx_fdt_probe (self, cur) != 0 || gx_fdt_mean (cur) >= self->fdt_abs)
-          break;                                   /* no finger: background good */
+          {
+            gx_bg_save (self->bg_frame);           /* no finger: background good */
+            break;
+          }
         if (timeout)
           {
             fp_warn ("finger still down after %d ms: taking the background "
@@ -1174,7 +1229,9 @@ gx_session_start (FpiDeviceGoodixTls *self)
              (int) ((g_get_monotonic_time () - t0) / 1000));
   }
 
-  /* Detection baseline; the wait above guarantees no finger is present. */
+  /* Detection baseline. The wait above leaves the finger lifted, except when a
+   * saved background was reused; the reading is then refused as a finger
+   * below, and the known idle level stands in for it. */
   {
     int t[12], acc[12] = { 0 }, nb = 0;
     for (q = 0; q < 4; q++)
@@ -2036,6 +2093,16 @@ gx_capture_done (GObject *src, GAsyncResult *res, gpointer user_data)
   /* Capture done: we no longer need the finger, only its release.
    * PRESENT without NEEDED is the "you may lift now" signal. */
   fpi_device_report_finger_status (dev, FP_FINGER_STATUS_PRESENT);
+
+  /* Verification takes a single capture, so its result is known now. Waiting
+   * for the lift first held the answer back until the user took the finger
+   * away, which reads as the sensor not working. Only enrolment, which needs
+   * a fresh press per stage, waits for the release. */
+  if (t->verifying)
+    {
+      fpi_ssm_jump_to_state (ssm, GX_ST_DONE);
+      return;
+    }
   t->polls = 0;
   self->poll_id = g_timeout_add (GX_POLL_MS, gx_poll_off, ssm);
 }
