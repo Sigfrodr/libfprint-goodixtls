@@ -5,15 +5,16 @@ same reverse-engineered protocol and open matcher as `main`, restructured to be
 built **inside the libfprint source tree** rather than as a TOD (Touch-on-Device)
 shared module.
 
-> **Status: hardware-validated bring-up (MateBook X Pro, GXFP5187).** Built into a
-> current libfprint `main` checkout (the patch applies cleanly there; on 1.94.x the
-> meson layout differs), `fprint-list-supported-devices` lists `GXFP5187` and the
-> native driver, run against the real sensor, completes the whole non-biometric
-> path: probe → open → GPIO reset → firmware read (`GF3288_ST411SEC_APP_11033`) →
-> PSK read → **TLS-PSK handshake up (`PSK-AES128-CBC-SHA256`)** → enrol started
-> (finger requested). Full enrol/verify matching wasn't run in this harness (needs
-> a finger), but the SPI transport, reset, PSK and TLS all work natively via
-> `FpiSpiTransfer`. The tested day-to-day variant is still the TOD driver on `main`.
+> **Status: validated end-to-end on hardware (MateBook X Pro, GXFP5187).** Built
+> into a current libfprint `main` checkout (the patch applies cleanly there; on
+> 1.94.x the meson layout differs), `fprint-list-supported-devices` lists
+> `GXFP5187` and the native driver, run against the real sensor through
+> libfprint's examples, goes probe → open → GPIO reset (line discovered from ACPI)
+> → firmware read (`GF3288_ST411SEC_APP_11033`) → PSK read → **TLS-PSK handshake
+> (`PSK-AES128-CBC-SHA256`)** → a full 15-stage enrol → a verify that **matches**
+> (57 inliers, threshold 15), all via `FpiSpiTransfer`. The day-to-day variant is
+> still the TOD driver on `main`; driver fixes land there first and are synced
+> here.
 >
 > **Requires one upstream libfprint fix.** `fpi_spi_transfer_submit_sync()` calls
 > `g_propagate_error(error, err)` unconditionally, so every *successful* synchronous
@@ -38,9 +39,8 @@ The whole difference from `main` is:
   raw `ioctl(SPI_IOC_MESSAGE)`;
 - `gx_dev_open` is offloaded to a worker so no blocking SPI runs on the main loop
   (the rest of the driver already used `FpiSsm` + worker offload);
-- the reset GPIO is a compiled default with an environment override (see below),
-  since the ACPI `_CRS` GpioIo discovery — the proper portable path — is not done
-  yet.
+- nothing else: the reset-GPIO discovery, FDT calibration, self-healing timings
+  and the deferred close are the same code as on `main`.
 
 Because the TOD entry point is gone, the standalone build/deploy scaffolding from
 `main` (`meson.build`, `install.sh`, the udev rule and the spidev conf) does not
@@ -84,11 +84,13 @@ libfprint generates the udev rules from the driver's `id_table`
 
 ## Reset GPIO
 
-The reset line defaults to the MateBook X Pro (`MACH-WX9`): `/dev/gpiochip0`,
-line 58. Other units in the family expose the reset on a different chip/line
-(a MateBook 13, for one, uses line 264). Until the driver discovers the line from
-the ACPI `_CRS` GpioIo — the proper, portable path, still open — override it at
-runtime:
+Other units in the family expose the reset on a different chip/line (the
+MateBook X Pro, `MACH-WX9`, uses `/dev/gpiochip0` line 58; a MateBook 13 uses
+line 264). The driver resolves it in order: the environment overrides below, then
+a best-effort decode of the sensor's ACPI `_CRS` GpioIo from
+`/sys/firmware/acpi/tables/DSDT` (Intel GNUM encoding), then the compiled
+`MACH-WX9` default. The assert polarity is not in `_CRS` and stays a per-model
+default. If discovery picks the wrong line, override it:
 
 ```
 GOODIXTLS_RESET_CHIP=/dev/gpiochipN

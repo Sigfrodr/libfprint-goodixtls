@@ -90,6 +90,8 @@ struct _FpiDeviceGoodixTls
   int           fdt_abs;     /* per-unit absolute floor, derived from baseline */
   int           timing_scale;/* protocol-delay multiplier in %, grows on desync */
   int           timing_saved;/* last value persisted to disk, to avoid rewrites */
+  gboolean      worker_active;/* a work thread is running; close must wait */
+  gboolean      close_pending;/* close was asked while a worker ran; do it after */
   gboolean      bg_dirty;    /* background taken with a finger down */
 };
 
@@ -377,32 +379,120 @@ gx_decode_12bit (const guint8 *data, gsize len, guint16 *out, gsize n)
 /*  Init, handshake and frame capture                                  */
 /* ------------------------------------------------------------------ */
 
-/* Hardware reset via the ACPI-declared GpioIo (see GOODIX_RESET_* above; the
- * chip/line are overridable through GOODIXTLS_RESET_CHIP / _LINE for units that
- * wire the reset elsewhere). A short PULSE is what the sensor wants; holding the
- * line down was measured to be counter-productive, recovery failing where a
- * pulse succeeds. Without this reset, leftovers from a previous run make init
- * and handshake fail. */
+/* Best-effort discovery of the reset GpioIo from the ACPI _CRS, so the line is
+ * not hardcoded across units (MateBook X Pro = gpiochip0/58, MateBook 13 = 264).
+ * Reads the DSDT, finds the sensor device, and decodes the reset pin from the
+ * Intel GNUM-encoded global that the _CRS feeds its GpioIo:
+ *     pin = (enc & 0xFFFF) + ((enc >> 16) & 0xFF) * 24
+ * then picks the gpiochip with enough lines. Intel-platform specific; the caller
+ * falls back to the compiled default and the GOODIXTLS_RESET_* overrides. The
+ * assert polarity is not in _CRS, so it stays a per-model default. Details in
+ * ACPI-RESET-DISCOVERY.md. Returns TRUE and fills the chip and line on success. */
+static guint
+gx_gnum_decode (guint32 enc)
+{
+  return (enc & 0xFFFF) + (((enc >> 16) & 0xFF) * 24);
+}
+
+static gboolean
+gx_discover_reset (gchar **chip_out, guint *line_out)
+{
+  g_autofree gchar *dsdt = NULL;
+  gsize len = 0;
+
+  if (!g_file_get_contents ("/sys/firmware/acpi/tables/DSDT", &dsdt, &len, NULL))
+    return FALSE;
+
+  const guint8 *d = (const guint8 *) dsdt;
+  gssize off = -1;
+  for (gsize i = 0; i + 8 <= len; i++)
+    if (memcmp (d + i, "GXFP5187", 8) == 0) { off = i; break; }
+  if (off < 0)
+    return FALSE;
+  gsize end = MIN ((gsize) off + 700, len);
+
+  /* require a GpioIo (large-resource 0x8C, connection type 1 = I/O) */
+  gboolean has_io = FALSE;
+  for (gsize k = off; k + 5 < end; k++)
+    if (d[k] == 0x8C && d[k + 3] == 1 && d[k + 4] == 1) { has_io = TRUE; break; }
+  if (!has_io)
+    return FALSE;
+
+  /* GNUM-encoded globals are DWordConst (0x0C + LE u32) referenced twice (SHPO in
+   * _INI, GNUM in _CRS). First-seen order: [0] = GpioInt (IRQ), [1] = GpioIo
+   * (reset). */
+  guint32 seen[8]; int nseen = 0, count[8] = { 0 };
+  for (gsize k = off; k + 5 < end; k++)
+    {
+      if (d[k] != 0x0C)
+        continue;
+      guint32 v = d[k + 1] | (d[k + 2] << 8) | (d[k + 3] << 16) | ((guint32) d[k + 4] << 24);
+      if (((v >> 16) & 0xFF) >= 0x10 || (v & 0xFFFF) >= 0x400 || gx_gnum_decode (v) >= 512)
+        continue;
+      int idx = -1;
+      for (int s = 0; s < nseen; s++) if (seen[s] == v) idx = s;
+      if (idx < 0 && nseen < 8) { seen[nseen] = v; idx = nseen++; }
+      if (idx >= 0) count[idx]++;
+    }
+  guint32 globs[8]; int ng = 0;
+  for (int s = 0; s < nseen; s++) if (count[s] >= 2 && ng < 8) globs[ng++] = seen[s];
+  if (ng < 2)
+    return FALSE;
+  guint line = gx_gnum_decode (globs[1]);
+
+  /* pick the first gpiochip that has enough lines (best effort) */
+  for (int n = 0; n < 8; n++)
+    {
+      g_autofree gchar *path = g_strdup_printf ("/dev/gpiochip%d", n);
+      int fd = open (path, O_RDONLY | O_CLOEXEC);
+      if (fd < 0)
+        { if (n == 0) continue; else break; }
+      struct gpiochip_info ci = { 0 };
+      gboolean ok = ioctl (fd, GPIO_GET_CHIPINFO_IOCTL, &ci) >= 0 && ci.lines > line;
+      close (fd);
+      if (ok) { *chip_out = g_steal_pointer (&path); *line_out = line; return TRUE; }
+    }
+  return FALSE;
+}
+
+/* Hardware reset via the ACPI-declared GpioIo. The line is resolved in order:
+ * the GOODIXTLS_RESET_CHIP / _LINE overrides, then best-effort discovery from the
+ * ACPI _CRS, then the compiled default. A short PULSE is what the sensor wants;
+ * holding the line down was measured to be counter-productive, recovery failing
+ * where a pulse succeeds. Without this reset, leftovers from a previous run make
+ * init and handshake fail. */
 static void
 gx_gpio_reset (FpiDeviceGoodixTls *self)
 {
   struct gpio_v2_line_request req = { 0 };
   struct gpio_v2_line_values val = { 0 };
-  const gchar *chip_path = g_getenv ("GOODIXTLS_RESET_CHIP");
+  const gchar *chip_env = g_getenv ("GOODIXTLS_RESET_CHIP");
   const gchar *line_env = g_getenv ("GOODIXTLS_RESET_LINE");
-  guint line = line_env ? (guint) g_ascii_strtoull (line_env, NULL, 10)
-                        : GOODIX_RESET_LINE;
+  g_autofree gchar *disc_chip = NULL;
+  const gchar *chip_path;
+  guint line;
   int chip;
 
-  chip_path = chip_path ? chip_path : GOODIX_RESET_CHIP;
+  if (chip_env || line_env)
+    {
+      chip_path = chip_env ? chip_env : GOODIX_RESET_CHIP;
+      line = line_env ? (guint) g_ascii_strtoull (line_env, NULL, 10) : GOODIX_RESET_LINE;
+    }
+  else if (gx_discover_reset (&disc_chip, &line))
+    {
+      chip_path = disc_chip;
+      fp_dbg ("reset: %s line %u discovered from ACPI _CRS", chip_path, line);
+    }
+  else
+    {
+      chip_path = GOODIX_RESET_CHIP;
+      line = GOODIX_RESET_LINE;
+    }
+
   chip = open (chip_path, O_RDWR | O_CLOEXEC);
   if (chip < 0)
     {
-      /* Never silent: fprintd's DeviceAllow= policy denies this even to root,
-       * and SPI still works without the reset, so the only symptom is a sensor
-       * that behaves like a protocol-timing bug. */
-      fp_warn ("reset: cannot open %s (%s); reset skipped "
-               "(see DeviceAllow= in fprintd.service.d)", chip_path,
+      fp_warn ("reset: cannot open %s (%s); reset skipped", chip_path,
                g_strerror (errno));
       return;
     }
@@ -419,12 +509,10 @@ gx_gpio_reset (FpiDeviceGoodixTls *self)
     }
   val.mask = 1;
   val.bits = 0;                          /* assert reset */
-  if (ioctl (req.fd, GPIO_V2_LINE_SET_VALUES_IOCTL, &val) < 0)
-    fp_warn ("reset: cannot assert line %u: %s", line, g_strerror (errno));
+  ioctl (req.fd, GPIO_V2_LINE_SET_VALUES_IOCTL, &val);
   g_usleep (10000);
   val.bits = 1;                          /* release */
-  if (ioctl (req.fd, GPIO_V2_LINE_SET_VALUES_IOCTL, &val) < 0)
-    fp_warn ("reset: cannot release line %u: %s", line, g_strerror (errno));
+  ioctl (req.fd, GPIO_V2_LINE_SET_VALUES_IOCTL, &val);
   g_usleep (120000);
   close (req.fd);
   close (chip);
@@ -1445,12 +1533,43 @@ gx_capture_thread (GTask *task, gpointer src, gpointer data, GCancellable *c)
   g_task_return_boolean (task, TRUE);
 }
 
+/* The actual teardown, shared between an immediate close and one deferred until
+ * a worker thread has finished. Safe to call only when no work thread is
+ * touching the state below: from gx_dev_close when no worker runs, or from a
+ * completion callback, which the main loop invokes only AFTER the thread has
+ * returned. */
+static void
+gx_finish_close (FpiDeviceGoodixTls *self)
+{
+  g_clear_handle_id (&self->poll_id, g_source_remove);
+  gx_tls_teardown (self);
+  if (self->spi_fd >= 0)
+    {
+      close (self->spi_fd);
+      self->spi_fd = -1;
+    }
+  g_clear_pointer (&self->bg_frame, g_free);
+  self->close_pending = FALSE;
+  fpi_device_close_complete (FP_DEVICE (self), NULL);
+}
+
 static void
 gx_session_done (GObject *src, GAsyncResult *res, gpointer user_data)
 {
   GxWork *w = g_task_get_task_data (G_TASK (res));
   FpiDeviceGoodixTls *self = FPI_DEVICE_GOODIXTLS (w->dev);
 
+  self->worker_active = FALSE;
+  if (self->close_pending)
+    {
+      /* close was requested while this thread ran; the thread is done now, so
+       * the deferred teardown is safe. Fail the SSM first to unwind the
+       * operation cleanly, then complete the close. */
+      fpi_ssm_mark_failed (w->ssm, g_error_new (G_IO_ERROR,
+        G_IO_ERROR_CANCELLED, "device closing"));
+      gx_finish_close (self);
+      return;
+    }
   if (!w->ok)
     {
       fpi_ssm_mark_failed (w->ssm, fpi_device_error_new_msg (
@@ -1478,6 +1597,7 @@ gx_run_async (FpiSsm *ssm, FpDevice *dev, GTaskThreadFunc fn,
 
   w->ssm = ssm;
   w->dev = dev;
+  FPI_DEVICE_GOODIXTLS (dev)->worker_active = TRUE;
   g_task_set_task_data (task, w, (GDestroyNotify) gx_work_free);
   g_task_run_in_thread (task, fn);
   g_object_unref (task);
@@ -1601,6 +1721,16 @@ gx_capture_done (GObject *src, GAsyncResult *res, gpointer user_data)
   FpiSsm *ssm = w->ssm;
   FpDevice *dev = w->dev;
   FpiDeviceGoodixTls *self = FPI_DEVICE_GOODIXTLS (dev);
+
+  self->worker_active = FALSE;
+  if (self->close_pending)
+    {
+      fpi_ssm_mark_failed (ssm, g_error_new (G_IO_ERROR,
+        G_IO_ERROR_CANCELLED, "device closing"));
+      gx_finish_close (self);
+      return;                       /* w->feat freed by gx_work_free */
+    }
+
   GxTask *t = fpi_ssm_get_data (ssm);
   GxSiftFeatures *f = g_steal_pointer (&w->feat);
 
@@ -1928,17 +2058,16 @@ gx_dev_close (FpDevice *dev)
 {
   FpiDeviceGoodixTls *self = FPI_DEVICE_GOODIXTLS (dev);
 
-  /* Cancel a pending finger-detection poll before tearing state down: it holds
-   * the SSM as user data and would fire on freed state otherwise. */
-  g_clear_handle_id (&self->poll_id, g_source_remove);
-  gx_tls_teardown (self);
-  if (self->spi_fd >= 0)
+  /* If a work thread is still running it is using spi_fd / tls / bg_frame;
+   * freeing them here would pull the ground out from under it — the shutdown
+   * segfault. Defer the whole teardown to the thread's completion callback,
+   * which the main loop runs only once the thread has returned. */
+  if (self->worker_active)
     {
-      close (self->spi_fd);
-      self->spi_fd = -1;
+      self->close_pending = TRUE;
+      return;
     }
-  g_clear_pointer (&self->bg_frame, g_free);
-  fpi_device_close_complete (dev, NULL);
+  gx_finish_close (self);
 }
 
 /* --- verification completion --------------------------------------- */
