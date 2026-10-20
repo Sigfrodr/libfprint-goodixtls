@@ -901,18 +901,39 @@ gx_fdt_drop (const int *base, const int *cur)
  * (6, 7 and 8) as soon as the set was widened — five samples from one finger
  * are not enough to set a security parameter.
  *
- * 15 sits at about twice the observed impostor maximum and well below the
- * genuine minimum measured on this template (20 over eight varied poses). Any
- * change to enrolment requires RE-MEASURING this against a varied impostor set. */
-#define GX_MATCH_THRESHOLD 15
+ * Hence a threshold that follows the template's size, and a cap on that size.
+ * Measured with tools/eval (one user, four fingers, 2100 impostor trials per
+ * point, the same captures for every gallery size), the false-accept rate at a
+ * fixed 15 grew with the views fused: 0.05 % at 15 views, 0.33 % at 20, 1.05 %
+ * at 30, 1.43 % at 36 — an impostor gets the best of more chances. Fusing only
+ * the best few views did not help. Holding about 0.05 % takes 15 up to 15
+ * views, 18 up to 20, and 20 up to 30, with 11-15 % rejects per capture. Past
+ * 30 it would keep climbing, so a template is never fused beyond GX_MAX_VIEWS.
+ * Any change to enrolment requires RE-MEASURING this. */
+#define GX_MAX_VIEWS 30
+
+static int
+gx_match_threshold (guint nviews)
+{
+  if (nviews <= 15)
+    return 15;
+  if (nviews <= 20)
+    return 18;
+  return 20;
+}
 
 /* What determines template quality is the number of DISTINCT presses, not the
  * raw number of captures: two captures taken back to back show almost the same
  * area, since the finger does not move within a second. Measured, 5 presses of
  * 3 views each got the genuine finger REJECTED, while a dozen distinct presses
  * gave reliable recognition. Coverage is the dominant factor. */
-#define GX_ENROLL_STAGES 15   /* presses asked of the user */
-#define GX_VIEWS_PER_STAGE 2  /* a second view adds slight variation for free */
+#define GX_ENROLL_STAGES 20   /* presses asked of the user */
+/* One view per press. A second one, captured right after the first, needed the
+ * finger held about 2.4 s; people lift after about one, so it usually came out
+ * empty and was dropped (87 of the views in one 8-enrolment collection) — and
+ * when it did land it showed the area the first had already seen. Five more
+ * distinct presses buy what the second view was meant to. */
+#define GX_VIEWS_PER_STAGE 1
 #define GX_ENROLL_VIEWS (GX_ENROLL_STAGES * GX_VIEWS_PER_STAGE)
 
 /* Reads the firmware version, which also proves the SPI dialogue works. */
@@ -1238,6 +1259,15 @@ gx_session_start (FpiDeviceGoodixTls *self)
           }
         if (timeout)
           {
+            /* The finger landed after the first probe and stayed: same case
+             * as one already down, so fall back on the saved background
+             * rather than fail (fprintd-enroll gives up on remove-finger). */
+            if (self->fdt_known && gx_bg_load (self->bg_frame, &age))
+              {
+                fp_info ("finger stayed down: using the background saved "
+                         "%d s ago", age);
+                break;
+              }
             fp_warn ("finger still down after %d ms: taking the background "
                      "anyway, capture will be degraded", GX_BG_WAIT_MS);
             self->bg_dirty = TRUE;
@@ -1492,8 +1522,8 @@ gx_views_from_print (FpPrint *print)
  * never lowers the bar for an attacker; it only widens the coverage of someone
  * who already passes. Without that rule a doubtful accept would be written
  * permanently into the template, which is template poisoning. */
-#define GX_ADAPT_MIN 30      /* twice the decision threshold, about four times
-                                the highest score any foreign finger reached */
+/* Acquisition threshold: twice the decision threshold for the template's size. */
+#define GX_ADAPT_MIN(threshold) (2 * (threshold))
 /* Novelty ceiling, expressed as a FRACTION of the capture's points rather than
  * an absolute count. The score scales with template richness — measured, a
  * 30-view template lifts ordinary poses from about 12 matches to about 100 — so
@@ -1501,7 +1531,6 @@ gx_views_from_print (FpPrint *print)
  * Above 60 % of points explained the pressed area is already well covered and
  * one more view would teach nothing. */
 #define GX_ADAPT_MAX_FRAC 0.60
-#define GX_ADAPT_VIEWS 20    /* cap, bounding verification time */
 /* The store must live INSIDE fprintd's state directory: its systemd unit
  * declares ProtectSystem=strict with StateDirectory=fprint, leaving the rest of
  * the filesystem read-only to it. The name starts with a dot so it can never be
@@ -1550,6 +1579,18 @@ gx_adapt_load (const gchar *path)
       off += sz;
     }
   return views;
+}
+
+/* Keeps only the most recent adapted views that fit under GX_MAX_VIEWS next to
+ * the enrolled ones. An older store can hold more (up to 20 next to a 30-view
+ * enrolment): they stay on disk, unused. */
+static void
+gx_adapt_cap (GPtrArray *extra, guint enrolled)
+{
+  guint room = enrolled < GX_MAX_VIEWS ? GX_MAX_VIEWS - enrolled : 0;
+
+  if (extra->len > room)
+    g_ptr_array_remove_range (extra, 0, extra->len - room);
 }
 
 static gboolean
@@ -1687,6 +1728,7 @@ typedef struct
   int             stage;   /* vue en cours */
   int             polls;   /* polls done in the current state */
   gboolean        verifying;
+  int             threshold; /* decision threshold for the template's size */
   GxSiftIsland   *island;  /* coverage accumulated, for enrolment guidance */
 } GxTask;
 
@@ -2051,6 +2093,8 @@ gx_capture_done (GObject *src, GAsyncResult *res, gpointer user_data)
       views = gx_views_from_print (tmpl);
       apath = gx_adapt_path (tmpl);
       extra = gx_adapt_load (apath);
+      gx_adapt_cap (extra, views->len);
+      t->threshold = gx_match_threshold (views->len + extra->len);
 
       /* Fusion des vues : on cumule les points de la capture qu'AU MOINS
        * at least one template view explains, instead of keeping only
@@ -2078,7 +2122,7 @@ gx_capture_done (GObject *src, GAsyncResult *res, gpointer user_data)
       g_clear_pointer (&t->probe, gx_sift_free);
       t->probe = f;
       fp_info ("verify: attempt %d -> %d matches (threshold %d)",
-               t->tries, t->best, GX_MATCH_THRESHOLD);
+               t->tries, t->best, t->threshold);
 
     }
   else
@@ -2374,10 +2418,12 @@ gx_verify_done (FpiSsm *ssm, FpDevice *dev, GError *error)
   {
     g_autofree gchar *apath = gx_adapt_path (template);
     g_autoptr(GPtrArray) extra = gx_adapt_load (apath);
+    guint stored = extra->len;
 
+    gx_adapt_cap (extra, views->len);
     fp_info ("verify: %d matches in %d attempt(s) "
              "(threshold %d, %u views + %u acquired)", best, t->tries,
-             GX_MATCH_THRESHOLD, views->len, extra->len);
+             t->threshold, views->len, extra->len);
 
     /* Acquisition window. The lower bound means certain identity; the upper
      * bound means the area is already well covered and would teach nothing.
@@ -2385,17 +2431,17 @@ gx_verify_done (FpiSsm *ssm, FpDevice *dev, GError *error)
      * on purpose, being too uncertain to trust. They enter the window by
      * themselves as the store fills out and lifts their score, so coverage
      * grows step by step without ever relaxing the safety constraint. */
-    if (best >= GX_ADAPT_MIN &&
+    if (best >= GX_ADAPT_MIN (t->threshold) &&
         best <= (int) (GX_ADAPT_MAX_FRAC * t->probe->n) &&
-        extra->len < GX_ADAPT_VIEWS)
+        views->len + stored < GX_MAX_VIEWS)
       {
         if (gx_adapt_append (apath, t->probe))
-          fp_info ("adaptive store: view acquired (%u/%d)",
-                   extra->len + 1, GX_ADAPT_VIEWS);
+          fp_info ("adaptive store: view acquired (%u/%u)", stored + 1,
+                   GX_MAX_VIEWS - views->len);
       }
   }
   fpi_device_verify_report (dev,
-                            best >= GX_MATCH_THRESHOLD ? FPI_MATCH_SUCCESS :
+                            best >= t->threshold ? FPI_MATCH_SUCCESS :
                             FPI_MATCH_FAIL,
                             NULL, NULL);
   fpi_device_verify_complete (dev, NULL);
