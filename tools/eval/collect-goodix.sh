@@ -3,12 +3,11 @@
 #
 # Collect GXFP5187 captures for fp_eval, then score the driver's own matcher.
 #
-# For each test finger it runs fprintd-enroll twice (up to 60 captures; in
-# practice about half, since the second view of a press is often taken after
-# the finger has been lifted and is dropped as empty), files the dumped
-# frames under that finger, and deletes the test enrolment again. Fingers
-# already enrolled for real are never touched: pick test fingers you do NOT
-# use to unlock.
+# For each test finger it runs fprintd-enroll twice (about 40 captures: one
+# per press, a gallery the size of the driver's plus held-out probes), files
+# the dumped frames under that finger, and deletes the test enrolment again.
+# Fingers already enrolled for real are never touched: pick test fingers you
+# do NOT use to unlock.
 #
 #     ./collect-goodix.sh [DIR] [finger ...]
 #
@@ -65,8 +64,8 @@ cc -O2 -shared -fPIC -o "$SO" "$HERE/plugin/goodix_rootsift.c" \
    $(pkg-config --cflags --libs glib-2.0) -lm
 
 python3 "$HERE/fp_eval.py" --captures "$DIR/captures" \
-        --sensor "GXFP5187 132x112" --enroll 15 --repeats 5 \
-        --backends none --backend-so "$SO" --at-threshold 15 \
+        --sensor "GXFP5187 132x112" --enroll 20 --repeats 5 \
+        --backends none --backend-so "$SO" --at-threshold 18 \
         --json "$DIR/report.json"
 echo
 echo "Aggregate report: $DIR/report.json (no images, safe to share)."

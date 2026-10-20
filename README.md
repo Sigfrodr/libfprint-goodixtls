@@ -92,8 +92,9 @@ published techniques (Lowe 2004; RootSIFT 2012):
 | same finger | mean 56.9, minimum **12** | mean 139, minimum **67** |
 | other finger | mean 1.8, maximum **3** | **0** everywhere |
 
-The driver decides at threshold **15**. A verification costs ~0.10 s of
-computation.
+The driver decides at a threshold that follows the template's size: **15** up
+to 15 views, **18** up to 20, **20** up to 30, and a template is never fused
+beyond 30 views (see below). A verification costs ~0.10 s of computation.
 
 ### ⚠️ The threshold depends on how rich the template is
 
@@ -120,6 +121,21 @@ widened.** Five samples from a single finger are not enough to tune a security
 parameter. Any change to enrolment requires **re-measuring** this threshold
 against a varied impostor set.
 
+**Measured with the evaluation harness** ([`tools/eval`](tools/eval): one user,
+four fingers, 2100 impostor trials per point, the same captures for every
+gallery size), the false-accept rate at a fixed threshold of 15 grew with the
+number of views fused — an impostor gets the best of more chances:
+
+| views fused | 15 | 20 | 30 | 36 |
+|---|---|---|---|---|
+| false accepts at 15 | 0.05 % | 0.33 % | 1.05 % | 1.43 % |
+| threshold holding ~0.05 % | 15 | 18 | 20 | > 20 |
+| false rejects (one capture) there | 15 % | 14 % | 12 % | – |
+
+Fusing only the best few views did not help. Hence the size-dependent threshold
+and the 30-view cap above; the reject rates are per single capture, before the
+three attempts `pam_fprintd` allows.
+
 Current distributions, on the template in service (40 views):
 
 | | scores |
@@ -129,8 +145,8 @@ Current distributions, on the template in service (40 views):
 | another person (28 captures) | mostly 0/3, max **9** |
 | a foreign finger, first set (5) | max 3 |
 
-The threshold of 15 sits at ~2× the impostor maximum, and 25 % below the
-legitimate minimum. Presses that are too far off-centre are discarded upstream
+On that 40-view template, then fused in full, the threshold of 15 sat at ~2× the
+impostor maximum of that set, and 25 % below the legitimate minimum. Presses that are too far off-centre are discarded upstream
 by the quality check, without even being scored.
 
 ### ⚠️ A retry must never depend on the score
@@ -157,7 +173,8 @@ lifted too early): those captures are discarded *without being scored*. It must
 never be conditioned on how close the score is to the threshold.
 
 Corollary for the adaptive store: its harmlessness rests on the acquisition
-threshold (30) being strictly above the decision threshold (15). It is indeed
+threshold (twice the decision threshold) being strictly above the decision
+threshold, and acquired views only fill the template up to the 30-view cap. It is indeed
 the acquired views — near-duplicates of already covered zones — that raise
 convenience without widening the extent, and therefore without giving a foreign
 finger more purchase: from 30 to 40 views, the impostor floor stayed at 8.

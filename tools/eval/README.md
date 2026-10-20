@@ -124,7 +124,8 @@ in place of the best-of-gallery rule.
 
 [`plugin/goodix_rootsift.c`](plugin/goodix_rootsift.c) wraps `goodix_sift.c`, the
 matcher the driver ships, including its view fusion (`fpeval_score_gallery`). Its
-decision threshold is 15. Verify retries and adapted views are left out, so the
+decision threshold follows the template's size (15 up to 15 views, 18 up to 20,
+20 up to 30). Verify retries and adapted views are left out, so the
 FRR it reports is a pessimistic bound.
 
 [`collect-goodix.sh`](collect-goodix.sh) does the whole run on a GXFP5187: it
@@ -133,7 +134,8 @@ enables the driver's capture dump, enrols each test finger twice with
 views are dropped), deletes each test enrolment again, converts the dumps with
 [`goodix_dump.py`](goodix_dump.py) (the driver's own preprocessing and
 no-finger rejection), builds the plug-in and runs it alone with `--enroll 15`,
-reporting FAR/FRR at the driver's threshold (`--at-threshold 15`):
+reporting FAR/FRR at the driver's threshold for a 20-view enrolment
+(`--at-threshold 18`):
 
 ```
 ./collect-goodix.sh ~/fp-eval-goodix left-index-finger left-middle-finger \

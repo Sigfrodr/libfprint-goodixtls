@@ -6,11 +6,12 @@
  * gx_sift_extract() and the gallery score is the driver's view fusion — the
  * probe points that AT LEAST ONE enrolled view explains, accumulated with
  * gx_sift_match_mask() exactly as the verify path in goodixtls.c does it. The
- * decision threshold to compare against is GX_MATCH_THRESHOLD (15).
+ * decision threshold to compare against follows the gallery size: see
+ * gx_match_threshold() (15 up to 15 views, 18 up to 20, 20 up to 30).
  *
- * What it does not reproduce: verify retries up to three presses and keeps the
- * best, and it also matches against views adapted after enrolment. Both only
- * help the genuine side, so the FRR measured here is a pessimistic bound.
+ * What it does not reproduce: pam_fprintd allows up to three attempts, and the
+ * driver also matches against views adapted after enrolment. Both only help
+ * the genuine side, so the FRR measured here is a pessimistic bound.
  *
  * Feed it captures converted by goodix_dump.py, which applies the driver's
  * preprocessing; the matcher is invariant to intensity scale and offset, so
