@@ -542,7 +542,12 @@ class App(Gtk.Application):
             return ""
         n, tries = hits[-1]
         s = _("{n} matches (attempt {tries})").format(n=n, tries=tries)
-        return s + _(" — view added to the template") if "view acquired" in out else s
+        if "view acquired" in out or "oldest view replaced" in out:
+            s += _(" — view added to the template")
+        if "template degrading" in out:
+            s += "\n" + _("Recent scores are falling towards the threshold: "
+                          "re-enrolling this finger is advised.")
+        return s
 
     def read_coverage(self):
         """Positions of the placed views, as the driver registered them."""
