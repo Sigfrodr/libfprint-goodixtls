@@ -62,6 +62,13 @@
  * client and the host is the server.
  */
 #define GOODIX_PSK_ADDR 0x20007f0c
+/* The address MOVES between firmware revisions of the same GF3288 generation:
+ * 0x20007f14 on GF3288_ST411SEC_APP_14003 (GXFP51A7). Reading the wrong one
+ * does not fail loudly: it returns eight zeros and the first forty key bytes,
+ * the read reports full length, and the only symptom is a handshake dying with
+ * "cipher operation failed". Located on a GXFP51A7 by reading a 128-byte window
+ * at 0x20007f00 with 0xF2: a clean 48-byte high-entropy block at +0x14. */
+#define GOODIX_PSK_ADDR_GXFP51A7 0x20007f14
 #define GOODIX_PSK_LEN 48
 #define GOODIX_TLS_IDENTITY "Client_identity"
 

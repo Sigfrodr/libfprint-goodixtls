@@ -1,16 +1,17 @@
-# Goodix GXFP5187 SPI (TLS-PSK) driver for libfprint
+# Goodix GXFP5187 / GXFP51A7 SPI (TLS-PSK) driver for libfprint
 #
 # Copyright (C) 2026 Benjamin Allègre (https://github.com/Sigfrodr)
 #
 # SPDX-License-Identifier: LGPL-2.1-or-later
-# Goodix GXFP5187 (SPI) — access to the spidev node for libfprint/fprintd
+# Goodix GXFP5187 / GXFP51A7 (SPI) — access to the spidev node for libfprint/fprintd
 #
 # libfprint enumerates the "spidev" subsystem and matches the driver by
-# correspondance du chemin sysfs avec l'ACPI id "GXFP5187".
+# correspondence between the sysfs path and the ACPI id (`GXFP5187` or
+# `GXFP51A7`).
 #
 # 1) Bind the spidev driver to the ACPI SPI device (creates /dev/spidevB.0).
-#    The spidev driver has no ACPI entry for GXFP5187, so the bind is forced
-#    through driver_override when the SPI device is added.
+#    The spidev driver has no ACPI entry for these sensors, so the bind is
+#    forced through driver_override when the SPI device is added.
 #
 #    The module must be LOADED first, otherwise /sys/bus/spi/drivers/spidev
 #    does not exist and the bind fails — and it is precisely because spidev has
@@ -21,8 +22,17 @@ ACTION=="add", SUBSYSTEM=="spi", ENV{MODALIAS}=="acpi:GXFP5187*", \
     ATTR{driver_override}="spidev", \
     RUN{builtin}+="kmod load spidev", \
     RUN+="/bin/sh -c 'echo %k > /sys/bus/spi/drivers/spidev/bind || logger -t goodixtls bind spidev failed for %k'"
+ACTION=="add", SUBSYSTEM=="spi", ENV{MODALIAS}=="acpi:GXFP51A7*", \
+    ATTR{driver_override}="spidev", \
+    RUN{builtin}+="kmod load spidev", \
+    RUN+="/bin/sh -c 'echo %k > /sys/bus/spi/drivers/spidev/bind || logger -t goodixtls bind spidev failed for %k'"
 
-# 2) Access to the resulting spidev node (sysfs path containing GXFP5187).
+# 2) Access to the resulting spidev node. One rule per supported id rather
+#    than a GXFP51* glob, which would also grab the GXFP51A0/51C0 that other
+#    drivers handle.
 ACTION=="add|change", SUBSYSTEM=="spidev", \
     KERNELS=="spi-GXFP5187:00", \
-    TAG+="uaccess", MODE="0660", GROUP="plugdev"
+    TAG+="uaccess", MODE="0660"
+ACTION=="add|change", SUBSYSTEM=="spidev", \
+    KERNELS=="spi-GXFP51A7:00", \
+    TAG+="uaccess", MODE="0660"

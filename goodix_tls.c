@@ -252,6 +252,12 @@ gx_tls_handshake_run (GxTls *t, GError **error)
       return FALSE;
     }
   SSL_CTX_set_psk_server_callback (t->ctx, psk_server_cb);
+  /* No session tickets: the MCU's record accounting has no room for a
+   * NewSessionTicket after the handshake. The GXFP5187 never asks for one, so
+   * this changes nothing there; it was tried on the GXFP51A7 as a cause of its
+   * 0xD0 reconnect aborts. The identity hint below, which makes OpenSSL send a
+   * ServerKeyExchange, is required: without it the MilanL gate stays closed. */
+  SSL_CTX_set_options (t->ctx, SSL_OP_NO_TICKET);
   if (t->identity)
     SSL_CTX_use_psk_identity_hint (t->ctx, t->identity);
 
@@ -359,29 +365,41 @@ gx_tls_decrypt_record (GxTls *t, const guint8 *raw, gsize raw_len,
 
   /* MAC covers seq_num || type || version || length || content. Verifying it
    * also confirms the sequence number is in step; a mismatch here is the loud
-   * failure that would otherwise show up as silently corrupt images. */
-  for (int i = 0; i < 8; i++)
-    hdr[i] = (guint8) (t->read_seq >> (56 - 8 * i));
+   * failure that would otherwise show up as silently corrupt images.
+   *
+   * The expected number is tried first, then a bounded window FORWARD. With no
+   * rekey path, one lost record would otherwise fail every later capture of
+   * the session with the same MAC error. A forward match is still
+   * MAC-verified, so it cannot admit a forged record, only step over a dropped
+   * one (and an older number is never accepted, so nothing can be replayed).
+   * From the GXFP51A7 bring-up (Sigfrodr/libfprint-goodixtls#4). */
   hdr[8] = raw[0];
   hdr[9] = raw[1];
   hdr[10] = raw[2];
   hdr[11] = (guint8) (content_len >> 8);
   hdr[12] = (guint8) content_len;
 
-  {
-    g_autofree guint8 *msg = g_malloc (sizeof hdr + content_len);
+  for (guint64 seq = t->read_seq; seq <= t->read_seq + 32; seq++)
+    {
+      g_autofree guint8 *msg = g_malloc (sizeof hdr + content_len);
 
-    memcpy (msg, hdr, sizeof hdr);
-    memcpy (msg + sizeof hdr, plain, content_len);
-    HMAC (EVP_sha256 (), t->client_mac, MAC_KEY_LEN, msg,
-          sizeof hdr + content_len, want, &want_len);
-  }
-  if (want_len != MAC_LEN || CRYPTO_memcmp (want, mac, MAC_LEN) != 0)
-    return -1;
-
-  memcpy (out, plain, content_len);
-  t->read_seq++;
-  return (gssize) content_len;
+      for (int i = 0; i < 8; i++)
+        hdr[i] = (guint8) (seq >> (56 - 8 * i));
+      memcpy (msg, hdr, sizeof hdr);
+      memcpy (msg + sizeof hdr, plain, content_len);
+      HMAC (EVP_sha256 (), t->client_mac, MAC_KEY_LEN, msg,
+            sizeof hdr + content_len, want, &want_len);
+      if (want_len == MAC_LEN && CRYPTO_memcmp (want, mac, MAC_LEN) == 0)
+        {
+          if (seq != t->read_seq)
+            g_warning ("TLS: %" G_GUINT64_FORMAT " record(s) lost, resynced",
+                       seq - t->read_seq);
+          t->read_seq = seq + 1;
+          memcpy (out, plain, content_len);
+          return (gssize) content_len;
+        }
+    }
+  return -1;
 }
 
 void

@@ -57,12 +57,44 @@
 /* Largest frame body we ever receive: the image, at about 22 kB. */
 #define GOODIX_RX_MAX 24000
 
+/* Per-model differences. Everything else in this driver is shared; a model
+ * row must only describe what was MEASURED to differ on that sensor.
+ *
+ * The GXFP51A7 row and the MilanL code paths it enables come from the bring-up
+ * by YoranSys (Sigfrodr/libfprint-goodixtls#4) on a MateBook 13 2019, board
+ * WRT-WX9, firmware GF3288_ST411SEC_APP_14003. The GXFP5187 row keeps the
+ * behaviour validated on the MateBook X Pro byte for byte. */
+typedef struct
+{
+  const gchar *acpi_id;
+  guint32      psk_addr;         /* see goodixtls.h */
+  guint        reset_line;       /* compiled default when _CRS discovery fails */
+  gboolean     reset_active_high;
+  gboolean     split_write;      /* header and body as two SPI messages */
+  guint        write_gap_us;     /* pause between the two halves */
+  gboolean     milanl;           /* MilanL capture path, see gx_milanl_* */
+} GxModel;
+
+static const GxModel gx_models[] = {
+  /* MateBook X Pro (MACH-WX9), firmware GF3288_ST411SEC_APP_11033. */
+  { "GXFP5187", GOODIX_PSK_ADDR, 58, FALSE, FALSE, 0, FALSE },
+  /* MateBook 13 2019 (WRT-WX9), firmware GF3288_ST411SEC_APP_14003. The reset
+   * is ACTIVE HIGH on this board, and a single-transfer frame gets only idle
+   * bytes back (split write: a checksum-valid reply every time). */
+  { "GXFP51A7", GOODIX_PSK_ADDR_GXFP51A7, 264, TRUE, TRUE, 2000, TRUE },
+};
+
 struct _FpiDeviceGoodixTls
 {
-  FpDevice parent;
+  FpDevice       parent;
 
-  int      spi_fd;
-  FpiSsm  *task_ssm;
+  const GxModel *model;      /* never NULL once opened */
+  gboolean       tls_reconn; /* the MCU sent 0xD0 (reconnect) during a drain */
+  guint16        fdt_meas[12]; /* MilanL: last measured FDT up base */
+  gboolean       fdt_meas_ok;
+
+  int            spi_fd;
+  FpiSsm        *task_ssm;
 
   /* TLS stack. Note the sensor is the client and we are the server. */
   GxTls   *tls;
@@ -104,6 +136,7 @@ fpi_tod_shared_driver_get_type (void)
 
 static const FpIdEntry goodixtls_id_table[] = {
   { .udev_types = FPI_DEVICE_UDEV_SUBTYPE_SPIDEV, .spi_acpi_id = "GXFP5187" },
+  { .udev_types = FPI_DEVICE_UDEV_SUBTYPE_SPIDEV, .spi_acpi_id = "GXFP51A7" },
   { .udev_types = 0 }
 };
 
@@ -113,15 +146,20 @@ static const guint8 GX_ENABLE[] = { 0x96, 0x03, 0x00, 0x01, 0x00, 0x10 };
 static const guint8 GX_REQTLS[] = { 0xd0, 0x03, 0x00, 0x00, 0x00, 0xd7 };
 
 /* ------------------------------------------------------------------ */
-/*  SPI transport: one frame is exactly one transfer                   */
+/*  SPI transport                                                      */
 /* ------------------------------------------------------------------ */
 
+/* On the GXFP5187 one frame is one transfer, chip select held across header
+ * and body. The GXFP51A7 wants the opposite: measured on that unit, a combined
+ * write gets only idle bytes back, while header and body as two messages,
+ * 2 ms apart as the vendor's SPI wrapper does, get a checksum-valid reply every
+ * time. */
 static gboolean
 gx_write_frame (FpiDeviceGoodixTls *self, guint8 type,
                 const guint8 *body, gsize n)
 {
   g_autofree guint8 *buf = g_malloc (n + 4);
-  struct spi_ioc_transfer xfer = { 0 };
+  struct spi_ioc_transfer xfer = { 0 }, xb = { 0 };
 
   buf[0] = type;
   buf[1] = n & 0xFF;
@@ -130,8 +168,53 @@ gx_write_frame (FpiDeviceGoodixTls *self, guint8 type,
   memcpy (buf + 4, body, n);
 
   xfer.tx_buf = (unsigned long) buf;
-  xfer.len = n + 4;
-  return ioctl (self->spi_fd, SPI_IOC_MESSAGE (1), &xfer) >= 1;
+  if (!self->model->split_write)
+    {
+      xfer.len = n + 4;
+      return ioctl (self->spi_fd, SPI_IOC_MESSAGE (1), &xfer) >= 1;
+    }
+  xfer.len = 4;
+  if (ioctl (self->spi_fd, SPI_IOC_MESSAGE (1), &xfer) < 1)
+    return FALSE;
+  if (self->model->write_gap_us)
+    g_usleep (self->model->write_gap_us);
+  xb.tx_buf = (unsigned long) (buf + 4);
+  xb.len = n;
+  return ioctl (self->spi_fd, SPI_IOC_MESSAGE (1), &xb) >= 1;
+}
+
+/* MilanL reads are full duplex, in bounded chunks. A half-duplex read (no
+ * tx_buf) is not reliable on this Intel LPSS controller for long transfers:
+ * the sibling gdix51c0 driver warns it "can produce corrupted or truncated
+ * payload bytes", and one flipped bit in an AES-CBC record fails its MAC. The
+ * GXFP5187 path keeps the half-duplex reads it was validated with. */
+#define GX_READ_CHUNK 4096
+static const guint8 gx_txfill[GX_READ_CHUNK];
+
+static gboolean
+gx_read_raw (FpiDeviceGoodixTls *self, guint8 *dst, gsize len)
+{
+  struct spi_ioc_transfer x = { 0 };
+
+  if (!self->model->milanl)
+    {
+      x.rx_buf = (unsigned long) dst;
+      x.len = len;
+      return ioctl (self->spi_fd, SPI_IOC_MESSAGE (1), &x) >= 1;
+    }
+  while (len > 0)
+    {
+      gsize n = MIN (len, (gsize) GX_READ_CHUNK);
+
+      x.tx_buf = (unsigned long) gx_txfill;
+      x.rx_buf = (unsigned long) dst;
+      x.len = n;
+      if (ioctl (self->spi_fd, SPI_IOC_MESSAGE (1), &x) < 1)
+        return FALSE;
+      dst += n;
+      len -= n;
+    }
+  return TRUE;
 }
 
 /* Reads one frame: a 4-byte header then the body. Returns the body length,
@@ -141,12 +224,9 @@ gx_read_frame (FpiDeviceGoodixTls *self, guint8 *out_type,
                guint8 *rx, gsize rx_cap)
 {
   guint8 hdr[4] = { 0 };
-  struct spi_ioc_transfer xh = { 0 }, xb = { 0 };
   guint16 n;
 
-  xh.rx_buf = (unsigned long) hdr;
-  xh.len = 4;
-  if (ioctl (self->spi_fd, SPI_IOC_MESSAGE (1), &xh) < 1)
+  if (!gx_read_raw (self, hdr, 4))
     return -1;
   if (hdr[0] != GOODIX_PKT_PLAIN && hdr[0] != GOODIX_PKT_TLS)
     return -1;
@@ -156,9 +236,7 @@ gx_read_frame (FpiDeviceGoodixTls *self, guint8 *out_type,
     return -1;
 
   g_usleep (200);                    /* let the sensor stage the body */
-  xb.rx_buf = (unsigned long) rx;
-  xb.len = n;
-  if (ioctl (self->spi_fd, SPI_IOC_MESSAGE (1), &xb) < 1)
+  if (!gx_read_raw (self, rx, n))
     return -1;
   return n;
 }
@@ -208,6 +286,8 @@ gx_send_plain_drain (FpiDeviceGoodixTls *self, const guint8 *body, gsize n)
       r = gx_read_frame (self, &ty, scratch, sizeof scratch);
       if (r > 0 && ty == GOODIX_PKT_PLAIN)   /* cleartext reply: keep draining */
         {
+          if (scratch[0] == 0xD0 && body[0] != 0xD0)
+            self->tls_reconn = TRUE;            /* MCU asks for a TLS reconnect */
           got++;
           misses = 0;
           g_usleep (5000);
@@ -414,7 +494,7 @@ gx_gnum_decode (guint32 enc)
 }
 
 static gboolean
-gx_discover_reset (gchar **chip_out, guint *line_out)
+gx_discover_reset (const gchar *acpi_id, gchar **chip_out, guint *line_out)
 {
   g_autofree gchar *dsdt = NULL;
   gsize len = 0;
@@ -425,7 +505,7 @@ gx_discover_reset (gchar **chip_out, guint *line_out)
   const guint8 *d = (const guint8 *) dsdt;
   gssize off = -1;
   for (gsize i = 0; i + 8 <= len; i++)
-    if (memcmp (d + i, "GXFP5187", 8) == 0)
+    if (memcmp (d + i, acpi_id, 8) == 0)
       {
         off = i;
         break;
@@ -503,10 +583,12 @@ gx_discover_reset (gchar **chip_out, guint *line_out)
 
 /* Hardware reset via the ACPI-declared GpioIo. The line is resolved in order:
  * the GOODIXTLS_RESET_CHIP / _LINE overrides, then best-effort discovery from the
- * ACPI _CRS, then the compiled default (GPIO 58 on gpiochip0, this unit). A short
- * PULSE is what the sensor wants; holding the line down was measured to be
- * counter-productive, recovery failing where a pulse succeeds. Without this reset,
- * leftovers from a previous run make init and handshake fail. */
+ * ACPI _CRS, then the model's compiled default. The polarity is not in _CRS: it
+ * comes from the model (active low on the GXFP5187, active high on the
+ * GXFP51A7), or GOODIXTLS_RESET_ACTIVE_HIGH. A short PULSE is what the sensor
+ * wants; holding the line asserted was measured to be counter-productive,
+ * recovery failing where a pulse succeeds. Without this reset, leftovers from a
+ * previous run make init and handshake fail. */
 static void
 gx_gpio_reset (FpiDeviceGoodixTls *self)
 {
@@ -514,6 +596,9 @@ gx_gpio_reset (FpiDeviceGoodixTls *self)
   struct gpio_v2_line_values val = { 0 };
   const gchar *chip_env = g_getenv ("GOODIXTLS_RESET_CHIP");
   const gchar *line_env = g_getenv ("GOODIXTLS_RESET_LINE");
+  const gchar *pol_env = g_getenv ("GOODIXTLS_RESET_ACTIVE_HIGH");
+  gboolean active_high = pol_env ? g_ascii_strtoull (pol_env, NULL, 10) != 0 :
+                         self->model->reset_active_high;
   g_autofree gchar *disc_chip = NULL;
   const gchar *chip_path;
   guint line;
@@ -522,9 +607,10 @@ gx_gpio_reset (FpiDeviceGoodixTls *self)
   if (chip_env || line_env)
     {
       chip_path = chip_env ? chip_env : "/dev/gpiochip0";
-      line = line_env ? (guint) g_ascii_strtoull (line_env, NULL, 10) : 58;
+      line = line_env ? (guint) g_ascii_strtoull (line_env, NULL, 10) :
+             self->model->reset_line;
     }
-  else if (gx_discover_reset (&disc_chip, &line))
+  else if (gx_discover_reset (self->model->acpi_id, &disc_chip, &line))
     {
       chip_path = disc_chip;
       fp_dbg ("reset: %s line %u discovered from ACPI _CRS", chip_path, line);
@@ -532,7 +618,7 @@ gx_gpio_reset (FpiDeviceGoodixTls *self)
   else
     {
       chip_path = "/dev/gpiochip0";
-      line = 58;
+      line = self->model->reset_line;
     }
 
   chip = open (chip_path, O_RDWR | O_CLOEXEC);
@@ -558,11 +644,11 @@ gx_gpio_reset (FpiDeviceGoodixTls *self)
       return;
     }
   val.mask = 1;
-  val.bits = 0;                          /* assert reset */
+  val.bits = active_high ? 1 : 0;        /* assert reset */
   if (ioctl (req.fd, GPIO_V2_LINE_SET_VALUES_IOCTL, &val) < 0)
     fp_warn ("reset: cannot assert line %u: %s", line, g_strerror (errno));
   g_usleep (10000);
-  val.bits = 1;                          /* release */
+  val.bits = active_high ? 0 : 1;        /* release: MCU running */
   if (ioctl (req.fd, GPIO_V2_LINE_SET_VALUES_IOCTL, &val) < 0)
     fp_warn ("reset: cannot release line %u: %s", line, g_strerror (errno));
   g_usleep (120000);
@@ -635,6 +721,26 @@ gx_tls_handshake (FpiDeviceGoodixTls *self)
   self->handshaking = FALSE;
   fp_info ("TLS-PSK session up (%s)", gx_tls_ciphersuite (self->tls));
   self->tls_up = TRUE;
+
+  /* MilanL: tell the MCU the session is up (0xD4), as Windows does; until then
+   * its gate drops 0x36 (FDT), 0x50 (NAV) and 0x20 (image) silently. Not right
+   * after the server Finished: measured on the GXFP51A7, without a settle the
+   * MCU acknowledges but never advances its TLS state and answers the image
+   * request with a 0xD0 reconnect request; 5 ms was enough, 50 kept as margin. */
+  if (self->model->milanl)
+    {
+      static const guint8 tls_ok[] = {
+        GOODIX_CMD_TLS_OK, 0x03, 0x00, 0x00, 0x00, 0xd3
+      };
+      guint8 ty, rx[64];
+      int n;
+
+      g_usleep (50000);
+      gx_send_plain_raw (self, tls_ok, sizeof tls_ok);
+      g_usleep (20000);
+      n = gx_read_frame (self, &ty, rx, sizeof rx);
+      fp_dbg ("post-handshake 0xD4 %s", n > 0 ? "acknowledged" : "not acknowledged");
+    }
   return TRUE;
 }
 
@@ -693,10 +799,114 @@ gx_send_capture_sequence (FpiDeviceGoodixTls *self)
     }
 }
 
+/* MilanL capture path (GXFP51A7). Instead of the fixed sequence above, the
+ * FDT scan base is measured and the follow-up commands derived from it, as the
+ * Windows driver's gf_milanl.c does:
+ *
+ *     down:  v = ((measure >> 1) << 8) | (measure >> 1)    (both bytes equal)
+ *     up:    d = (measure >> 1) + delta;  v = (d << 8) | d
+ *
+ * where the GXFP5187's ChicagoHS sibling ORs 0x80 into the low byte instead.
+ * Sending the ChicagoHS values to a MilanL part made it answer the image
+ * request with a 0xD0 reconnect request instead of the image. delta is the
+ * per-unit register 0x0082; 0x15 is the MilanL constant used until it is read.
+ * The ChicagoHS DAC register writes are left out: they corrupted the MilanL
+ * DAC. The background is captured unarmed, a finger frame armed. */
+#define GX_MILANL_FDT_DELTA 0x15
+
+static gboolean
+gx_milanl_fdt_manual (FpiDeviceGoodixTls *self, guint16 *vals)
+{
+  static const guint8 init[24] = {
+    0xa6, 0xa6, 0xb9, 0xb9, 0xbc, 0xbc, 0xb7, 0xb7, 0xa8, 0xa8, 0xba, 0xba,
+    0xb7, 0xb7, 0xb8, 0xb8, 0xa8, 0xa8, 0xc1, 0xc1, 0xba, 0xba, 0xb5, 0xb5
+  };
+  guint8 b[64], rx[256], ty;
+  int len = 0, k, n;
+
+  b[len++] = 0x36;
+  b[len++] = 3 + sizeof init;
+  b[len++] = 0;
+  b[len++] = 0x0d;
+  b[len++] = 0x01;
+  memcpy (b + len, init, sizeof init);
+  len += sizeof init;
+  b[len] = goodix_body_cksum (b, len);
+  len++;
+
+  gx_send_plain_raw (self, b, len);
+  g_usleep (15000 * self->timing_scale / 100);
+  gx_read_frame (self, &ty, rx, sizeof rx);          /* ACK */
+  g_usleep (8000 * self->timing_scale / 100);
+  n = gx_read_frame (self, &ty, rx, sizeof rx);      /* payload */
+  if (n < 7 + 24)
+    return FALSE;
+  for (k = 0; k < 12; k++)
+    vals[k] = rx[7 + 2 * k] | (rx[8 + 2 * k] << 8);
+  return TRUE;
+}
+
+/* cmd/hdr: 0x36/0x0d manual, 0x32/0x0c down, 0x34/0x0e up. */
+static void
+gx_milanl_fdt_write (FpiDeviceGoodixTls *self, guint8 cmd, guint8 hdr,
+                     const guint16 *vals)
+{
+  guint8 b[64];
+  int len = 0, k;
+
+  b[len++] = cmd;
+  b[len++] = 3 + 24;
+  b[len++] = 0;
+  b[len++] = hdr;
+  b[len++] = 0x01;
+  for (k = 0; k < 12; k++)
+    {
+      guint16 d = vals[k] >> 1;
+      guint16 v;
+
+      if (cmd == 0x34)
+        d = (guint16) (d + GX_MILANL_FDT_DELTA);
+      v = (guint16) ((d << 8) | d);
+      b[len++] = v & 0xff;
+      b[len++] = (v >> 8) & 0xff;
+    }
+  b[len] = goodix_body_cksum (b, len);
+  len++;
+  gx_send_plain_drain (self, b, len);
+}
+
+static void
+gx_milanl_capture_sequence (FpiDeviceGoodixTls *self, gboolean arm)
+{
+  const gint64 gap = GX_SEQ_GAP_US * self->timing_scale / 100;
+  guint16 vals[12];
+
+  gx_send_plain_drain (self, (const guint8[]){ 0xae, 0x02, 0x00, 0x55, 0xa5 }, 5);
+  g_usleep (gap);
+  self->fdt_meas_ok = gx_milanl_fdt_manual (self, vals);
+  if (self->fdt_meas_ok)
+    memcpy (self->fdt_meas, vals, sizeof vals);
+  g_usleep (gap);
+  gx_send_plain_drain (self, (const guint8[]){ 0x50, 0x03, 0x00, 0x01, 0x00, 0x56 }, 6);
+  g_usleep (gap);
+  if (self->fdt_meas_ok)
+    {
+      gx_milanl_fdt_write (self, 0x36, 0x0d, vals);
+      g_usleep (gap);
+      if (arm)
+        {
+          gx_milanl_fdt_write (self, 0x32, 0x0c, vals);
+          g_usleep (gap);
+        }
+    }
+  gx_send_plain_drain (self, (const guint8[]){ 0x20, 0x03, 0x00, 0x01, 0x00, 0x86 }, 6);
+  g_usleep (gap);
+}
+
 /* Captures one full image, assuming a TLS session is already up, and fills
  * px[GOODIX_IMG_PIXELS] with 12-bit samples. */
 static gboolean
-gx_capture_frame (FpiDeviceGoodixTls *self, guint16 *px)
+gx_capture_frame (FpiDeviceGoodixTls *self, guint16 *px, gboolean arm)
 {
   g_autofree guint8 *img = g_malloc (GOODIX_RX_MAX);
   guint8 st = 0x55;
@@ -704,9 +914,19 @@ gx_capture_frame (FpiDeviceGoodixTls *self, guint16 *px)
 
   gint64 tA = g_get_monotonic_time ();
 
-  gx_tls_cmd (self, GOODIX_CMD_MCU_STATE, &st, 1);   /* mcu_state sur TLS */
-  g_usleep (80000);
-  gx_send_capture_sequence (self);
+  self->tls_reconn = FALSE;
+  if (self->model->milanl)
+    {
+      /* MilanL's sequence queries the state in clear (0xae 0x55); an extra
+       * MCU_STATE over TLS made it emit a spurious 0xD0 after the image ACK. */
+      gx_milanl_capture_sequence (self, arm);
+    }
+  else
+    {
+      gx_tls_cmd (self, GOODIX_CMD_MCU_STATE, &st, 1);   /* mcu_state sur TLS */
+      g_usleep (80000);
+      gx_send_capture_sequence (self);
+    }
   fp_dbg ("timing: capture sequence %ld us",
           (long) (g_get_monotonic_time () - tA));
 
@@ -726,6 +946,10 @@ gx_capture_frame (FpiDeviceGoodixTls *self, guint16 *px)
         memcpy (rec, self->tls_rx + self->tls_rxpos, raw);
         self->tls_rxlen = self->tls_rxpos = 0;
       }
+    else if (self->tls_reconn)
+      {
+        fp_warn ("sensor asked for a TLS reconnect instead of the image");
+      }
     else
       {
         guint8 ty;
@@ -735,6 +959,14 @@ gx_capture_frame (FpiDeviceGoodixTls *self, guint16 *px)
             raw = gx_read_frame (self, &ty, rec, GOODIX_RX_MAX);
             if (raw > 0 && ty == GOODIX_PKT_TLS)
               break;
+            if (raw > 0 && ty == GOODIX_PKT_PLAIN && rec[0] == 0xD0)
+              {
+                /* The MCU asks for a TLS reconnect instead of sending the
+                 * image (seen on MilanL when its state did not advance). */
+                fp_warn ("sensor asked for a TLS reconnect instead of the image");
+                raw = 0;
+                break;
+              }
             raw = 0;
             g_usleep (20000);
           }
@@ -761,6 +993,14 @@ gx_capture_frame (FpiDeviceGoodixTls *self, guint16 *px)
   /* Header is a tag, a 16-bit length and five zero bytes, then the 12-bit
    * samples: skip 8 bytes. */
   gx_decode_12bit (img + 8, total - 8, px, GOODIX_IMG_PIXELS);
+
+  /* MilanL: leave the armed state after a finger frame, as the reference
+   * driver does with fdt_up. */
+  if (self->model->milanl && arm && self->fdt_meas_ok)
+    {
+      gx_milanl_fdt_write (self, 0x34, 0x0e, self->fdt_meas);
+      g_usleep (GX_SEQ_GAP_US * self->timing_scale / 100);
+    }
   return TRUE;
 }
 
@@ -788,7 +1028,7 @@ gx_capture_avg (FpiDeviceGoodixTls *self, int nframes, guint16 *avg)
 
   for (f = 0; f < nframes; f++)
     {
-      if (!gx_capture_frame (self, px))
+      if (!gx_capture_frame (self, px, FALSE))     /* background: unarmed */
         continue;
       for (i = 0; i < GOODIX_IMG_PIXELS; i++)
         acc[i] += px[i];
@@ -1426,7 +1666,7 @@ gx_capture_features (FpiDeviceGoodixTls *self)
   double m = 0, v = 0;
   int i;
 
-  if (!gx_capture_frame (self, px))
+  if (!gx_capture_frame (self, px, TRUE))
     return NULL;
   gx_dump_capture (self, px);
   img = gx_preprocess (self, px);
@@ -2234,6 +2474,16 @@ gx_enroll_done (FpiSsm *ssm, FpDevice *dev, GError *error)
  * so captures — the sensor refuses long exchanges such as the memory read while
  * short commands still work. It then needs a reset, and from the third attempt
  * a full reopen of the spidev node to clear the kernel driver's state too. */
+/* The key's address moves between firmware revisions; GOODIXTLS_PSK_ADDR
+* overrides the model's, to bring up a new revision without a rebuild. */
+static guint32
+gx_psk_addr (FpiDeviceGoodixTls *self)
+{
+  const gchar *env = g_getenv ("GOODIXTLS_PSK_ADDR");
+
+  return env ? (guint32) g_ascii_strtoull (env, NULL, 0) : self->model->psk_addr;
+}
+
 static gboolean
 gx_read_psk (FpiDeviceGoodixTls *self, const gchar *path)
 {
@@ -2247,7 +2497,7 @@ gx_read_psk (FpiDeviceGoodixTls *self, const gchar *path)
       while (gx_read_frame (self, &ty, junk, sizeof junk) > 0)
         ;
 
-      if (gx_mem_read (self, GOODIX_PSK_ADDR, GOODIX_PSK_LEN,
+      if (gx_mem_read (self, gx_psk_addr (self), GOODIX_PSK_LEN,
                        self->psk) == GOODIX_PSK_LEN)
         {
           if (att > 1)
@@ -2278,6 +2528,26 @@ gx_read_psk (FpiDeviceGoodixTls *self, const gchar *path)
   return FALSE;
 }
 
+/* Picks the model from the ACPI id behind the spidev node:
+ * /dev/spidev0.0 -> /sys/class/spidev/spidev0.0/device -> ../spi-GXFP51A7:00.
+ * Falls back to the GXFP5187, whose path this driver was validated on. */
+static const GxModel *
+gx_model_for (const gchar *spidev_path)
+{
+  const gchar *base = spidev_path ? strrchr (spidev_path, '/') : NULL;
+  g_autofree gchar *sys = NULL, *link = NULL;
+  guint i;
+
+  if (!base)
+    return &gx_models[0];
+  sys = g_strdup_printf ("/sys/class/spidev/%s/device", base + 1);
+  link = g_file_read_link (sys, NULL);
+  for (i = 0; link && i < G_N_ELEMENTS (gx_models); i++)
+    if (strstr (link, gx_models[i].acpi_id))
+      return &gx_models[i];
+  return &gx_models[0];
+}
+
 static void
 gx_dev_open (FpDevice *dev)
 {
@@ -2290,6 +2560,8 @@ gx_dev_open (FpDevice *dev)
   gx_adapt_sweep ();
 
   path = fpi_device_get_udev_data (dev, FPI_DEVICE_UDEV_SUBTYPE_SPIDEV);
+  self->model = gx_model_for (path);
+  self->fdt_meas_ok = FALSE;
   self->spi_fd = open (path, O_RDWR);
   if (self->spi_fd < 0)
     {
@@ -2334,7 +2606,7 @@ gx_dev_open (FpDevice *dev)
   gx_gpio_reset (self);
 
   if (gx_read_fw_version (self, fw, sizeof fw))
-    fp_info ("GXFP5187 firmware: %s", fw);
+    fp_info ("%s firmware: %s", self->model->acpi_id, fw);
   if (!gx_read_psk (self, path))
     fp_warn ("key read failed; the TLS channel cannot be opened");
 
@@ -2484,7 +2756,7 @@ fpi_device_goodixtls_class_init (FpiDeviceGoodixTlsClass *klass)
   FpDeviceClass *dev_class = FP_DEVICE_CLASS (klass);
 
   dev_class->id = "goodixtls";
-  dev_class->full_name = "Goodix GXFP5187 SPI (TLS-PSK)";
+  dev_class->full_name = "Goodix GXFP5187/GXFP51A7 SPI (TLS-PSK)";
   dev_class->type = FP_DEVICE_TYPE_UDEV;
   dev_class->id_table = goodixtls_id_table;
   dev_class->scan_type = FP_SCAN_TYPE_PRESS;
