@@ -145,6 +145,28 @@ reporting FAR/FRR at the driver's threshold for a 20-view enrolment
 Use fingers you do not unlock with; the script refuses one that is enrolled. The
 captures stay in that directory; only the printed report is meant to be shared.
 
+## libfprint's proposed SIGFM matcher
+
+[`plugin/libfprint_sigfm.cpp`](plugin/libfprint_sigfm.cpp) wraps `sigfm.cpp` from
+libfprint!530 unchanged, with libfprint's own rules: images under 25 keypoints
+are refused, and a probe matches when any enrolled view reaches the driver's
+threshold (best of gallery, fp_eval's default). Build it against a checkout of
+that branch (OpenCV 4 required; the command is in the file header).
+
+On a GXFP5187 (one user, four fingers, 40 captures each, 2400 impostor trials
+per point), at the threshold of 24 the elan drivers use:
+
+| enrolled views | 5 | 10 | 15 | 20 |
+|---|---|---|---|---|
+| false accepts | 0 % | 0 % | 0 % | 0 % |
+| false rejects (one capture) | 16.7 % | 3.3 % | 1.6 % | 1.5 % |
+| impostor max | 1 | 1 | 1 | 1 |
+
+Impostors score 0 or 1 whatever the gallery size, against genuine medians in the
+tens of thousands: unlike this driver's fusion, SIGFM's margin does not erode as
+the template grows. On the same captures this driver's matcher, at its own
+thresholds, rejected 3.8 % (15 views) and 4.25 % (20 views).
+
 ## Reading the result
 
 ```
