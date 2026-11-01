@@ -211,3 +211,10 @@ msgstr "Surface couverte : {ratio:.1f}× un appui — {n} points"
 
 msgid " ({n} touch(es) with no overlap)"
 msgstr " ({n} appui(s) sans recouvrement)"
+
+msgid ""
+"Recent scores are falling towards the threshold: re-enrolling this finger is "
+"advised."
+msgstr ""
+"Les scores récents se rapprochent du seuil : il est conseillé de ré-enrôler ce "
+"doigt."

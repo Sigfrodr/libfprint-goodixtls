@@ -1624,15 +1624,126 @@ gx_adapt_append (const gchar *path, const GxSiftFeatures *f)
   return ok;
 }
 
+/* Rewrites the whole store with @views (B: rolling replacement). Written to a
+ * temporary file and renamed over the old one, so a crash leaves either the
+ * old store or the new one, never a torn file. */
+static gboolean
+gx_adapt_rewrite (const gchar *path, GPtrArray *views)
+{
+  g_autoptr(GByteArray) all = g_byte_array_new ();
+  g_autofree gchar *tmp = NULL;
+  guint i;
+
+  if (!path)
+    return FALSE;
+  for (i = 0; i < views->len; i++)
+    {
+      g_autoptr(GByteArray) blob = gx_sift_serialize (g_ptr_array_index (views, i));
+      guint32 sz;
+
+      if (!blob)
+        return FALSE;
+      sz = blob->len;
+      g_byte_array_append (all, (const guint8 *) &sz, 4);
+      g_byte_array_append (all, blob->data, blob->len);
+    }
+  tmp = g_strconcat (path, ".tmp", NULL);
+  if (!g_file_set_contents (tmp, (const gchar *) all->data, all->len, NULL) ||
+      g_chmod (tmp, 0600) != 0 || g_rename (tmp, path) != 0)
+    {
+      fp_warn ("adaptive store: cannot rewrite %s", path);
+      g_unlink (tmp);
+      return FALSE;
+    }
+  return TRUE;
+}
+
+/* Recent verification scores for one template, kept next to its store (E).
+ * A template that no longer fits the finger shows it as a falling median well
+ * before verifications start failing outright; the journal then says so, and
+ * gx-verify.py relays it. Every verification counts, matched or not: after a
+ * long pause the drop can be abrupt, and the failures are the signal. */
+#define GX_SCORE_HISTORY 8
+#define GX_SCORE_WARN_MIN 5           /* entries before the median means much */
+
+static gchar *
+gx_score_path (const gchar *adapt_path)
+{
+  if (!adapt_path || !g_str_has_suffix (adapt_path, ".views"))
+    return NULL;
+  return g_strdup_printf ("%.*s.scores",
+                          (int) (strlen (adapt_path) - strlen (".views")),
+                          adapt_path);
+}
+
+static int
+gx_cmp_int (const void *a, const void *b)
+{
+  return *(const int *) a - *(const int *) b;
+}
+
+static void
+gx_score_record (const gchar *adapt_path, int score, int threshold)
+{
+  g_autofree gchar *path = gx_score_path (adapt_path), *txt = NULL;
+
+  g_auto(GStrv) old = NULL;
+  int v[GX_SCORE_HISTORY], sorted[GX_SCORE_HISTORY], n = 0, i, median;
+  GString *out;
+
+  if (!path)
+    return;
+  if (g_file_get_contents (path, &txt, NULL, NULL))
+    old = g_strsplit_set (g_strstrip (txt), " \n", -1);
+  for (i = 0; old && old[i]; i++)
+    if (*old[i])
+      {
+        if (n == GX_SCORE_HISTORY)
+          {
+            memmove (v, v + 1, sizeof v[0] * (GX_SCORE_HISTORY - 1));
+            n--;
+          }
+        v[n++] = atoi (old[i]);
+      }
+  if (n == GX_SCORE_HISTORY)
+    {
+      memmove (v, v + 1, sizeof v[0] * (GX_SCORE_HISTORY - 1));
+      n--;
+    }
+  v[n++] = score;
+
+  out = g_string_new (NULL);
+  for (i = 0; i < n; i++)
+    g_string_append_printf (out, i ? " %d" : "%d", v[i]);
+  g_string_append_c (out, '\n');
+  if (g_mkdir_with_parents (GX_ADAPT_DIR, 0700) == 0 &&
+      g_file_set_contents (path, out->str, out->len, NULL))
+    g_chmod (path, 0600);
+  g_string_free (out, TRUE);
+
+  if (n < GX_SCORE_WARN_MIN)
+    return;
+  memcpy (sorted, v, sizeof v[0] * n);
+  qsort (sorted, n, sizeof sorted[0], gx_cmp_int);
+  median = sorted[n / 2];
+  if (median * 2 < threshold * 3)
+    fp_warn ("template degrading: the last %d verifications scored a median "
+             "of %d against a threshold of %d; re-enrolling this finger is "
+             "advised", n, median, threshold);
+}
+
 /* Clears the store when its template is deleted or re-enrolled: acquired views
  * must not outlive the template that authorised them. */
 static void
 gx_adapt_clear (FpPrint *print)
 {
   g_autofree gchar *path = gx_adapt_path (print);
+  g_autofree gchar *scores = gx_score_path (path);
 
   if (path && g_unlink (path) == 0)
     fp_info ("adaptive store cleared (%s)", path);
+  if (scores)
+    g_unlink (scores);
 }
 
 /* fprintd deletes the template itself and NEVER tells the driver: our prints
@@ -1661,9 +1772,12 @@ gx_adapt_sweep (void)
       gchar *dot;
       GDir *dd;
 
-      if (!g_str_has_suffix (name, ".views"))
+      if (g_str_has_suffix (name, ".views"))
+        stem = g_strndup (name, strlen (name) - strlen (".views"));
+      else if (g_str_has_suffix (name, ".scores"))
+        stem = g_strndup (name, strlen (name) - strlen (".scores"));
+      else
         continue;
-      stem = g_strndup (name, strlen (name) - strlen (".views"));
 
       /* Split "<user>.<finger>" at the LAST dot: a user name may itself
        * contain one. */
@@ -2404,12 +2518,37 @@ gx_verify_done (FpiSsm *ssm, FpDevice *dev, GError *error)
      * grows step by step without ever relaxing the safety constraint. */
     if (best >= GX_ADAPT_MIN (t->threshold) &&
         best <= (int) (GX_ADAPT_MAX_FRAC * t->probe->n) &&
-        views->len + stored < GX_MAX_VIEWS)
+        views->len < GX_MAX_VIEWS)
       {
-        if (gx_adapt_append (apath, t->probe))
-          fp_info ("adaptive store: view acquired (%u/%u)", stored + 1,
-                   GX_MAX_VIEWS - views->len);
+        guint room = GX_MAX_VIEWS - views->len;
+
+        if (stored < room)
+          {
+            if (gx_adapt_append (apath, t->probe))
+              fp_info ("adaptive store: view acquired (%u/%u)", stored + 1,
+                       room);
+          }
+        else
+          {
+            /* Full: replace the oldest view in use rather than freeze. A
+             * store that only ever filled up stopped following the finger
+             * once its room was taken. extra already holds the newest
+             * `room` views; older surplus on disk is dropped with it. The
+             * entry conditions are the same as for an append. */
+            g_autoptr(GByteArray) blob = gx_sift_serialize (t->probe);
+            GxSiftFeatures *copy = blob ? gx_sift_deserialize (blob->data, blob->len) : NULL;
+
+            if (copy)
+              {
+                g_ptr_array_remove_index (extra, 0);
+                g_ptr_array_add (extra, copy);
+                if (gx_adapt_rewrite (apath, extra))
+                  fp_info ("adaptive store: oldest view replaced (%u/%u)",
+                           extra->len, room);
+              }
+          }
       }
+    gx_score_record (apath, best, t->threshold);
   }
   fpi_device_verify_report (dev,
                             best >= t->threshold ? FPI_MATCH_SUCCESS :
