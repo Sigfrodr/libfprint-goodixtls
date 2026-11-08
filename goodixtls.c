@@ -2349,7 +2349,7 @@ gx_enroll_done (FpiSsm *ssm, FpDevice *dev, GError *error)
  * short commands still work. It then needs a reset, and from the third attempt
  * a full reopen of the spidev node to clear the kernel driver's state too. */
 static gboolean
-gx_read_psk (FpiDeviceGoodixTls *self, const gchar *path)
+gx_read_psk (FpiDeviceGoodixTls *self, const gchar *path, guint32 psk_addr)
 {
   int att;
 
@@ -2361,7 +2361,7 @@ gx_read_psk (FpiDeviceGoodixTls *self, const gchar *path)
       while (gx_read_frame (self, &ty, junk, sizeof junk) > 0)
         ;
 
-      if (gx_mem_read (self, GOODIX_PSK_ADDR, GOODIX_PSK_LEN,
+      if (gx_mem_read (self, psk_addr, GOODIX_PSK_LEN,
                        self->psk) == GOODIX_PSK_LEN)
         {
           if (att > 1)
@@ -2399,6 +2399,7 @@ gx_dev_open (FpDevice *dev)
   GError *err = NULL;
   const gchar *path;
   gchar fw[64] = "";
+  guint32 psk_addr = GOODIX_PSK_ADDR;
 
   /* Drop stores whose fprintd template was deleted meanwhile. */
   gx_adapt_sweep ();
@@ -2449,7 +2450,10 @@ gx_dev_open (FpDevice *dev)
 
   if (gx_read_fw_version (self, fw, sizeof fw))
     fp_info ("GXFP5187 firmware: %s", fw);
-  if (!gx_read_psk (self, path))
+  if (g_str_equal (fw, "GF3288_ST411SEC_APP_11034"))
+    psk_addr = GOODIX_PSK_ADDR_11034;
+  fp_dbg ("reading PSK from firmware-specific RAM address 0x%08x", psk_addr);
+  if (!gx_read_psk (self, path, psk_addr))
     fp_warn ("key read failed; the TLS channel cannot be opened");
 
   fpi_device_open_complete (dev, NULL);
