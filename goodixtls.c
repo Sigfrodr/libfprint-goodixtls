@@ -1172,6 +1172,35 @@ gx_bg_load (guint16 *bg, int *age_s)
   return TRUE;
 }
 
+/* A finger pulls the whole raw frame down, by 500 to 800 counts on the
+ * reference unit (about 2700 empty, 1900 to 2200 with a finger), far more
+ * than the background moves between sessions. */
+#define GX_BG_FINGER_SHIFT 250
+
+static double
+gx_frame_mean (const guint16 *px)
+{
+  double s = 0;
+  int i;
+
+  for (i = 0; i < GOODIX_IMG_PIXELS; i++)
+    s += px[i];
+  return s / GOODIX_IMG_PIXELS;
+}
+
+/* Mean of the background on file whatever its age, or -1 without one. */
+static double
+gx_bg_ref_mean (void)
+{
+  g_autofree gchar *data = NULL;
+  gsize len = 0;
+
+  if (!g_file_get_contents (GX_BG_FILE, &data, &len, NULL) ||
+      len != sizeof (guint16) * GOODIX_IMG_PIXELS)
+    return -1;
+  return gx_frame_mean ((const guint16 *) data);
+}
+
 static void
 gx_bg_save (const guint16 *bg)
 {
@@ -1208,7 +1237,7 @@ gx_session_start (FpiDeviceGoodixTls *self)
     self->bg_frame = g_malloc (sizeof (guint16) * GOODIX_IMG_PIXELS);
 
   {
-    int cur[12], waited = 0, age = 0;
+    int cur[12], waited = 0, age = 0, rejected = 0;
     gboolean timeout = FALSE, reused = FALSE;
     gint64 t0 = g_get_monotonic_time ();
 
@@ -1251,12 +1280,33 @@ gx_session_start (FpiDeviceGoodixTls *self)
 
         /* The capture itself lasts about 1.5 s, so a finger can land while it
          * runs and end up baked into the background. Check once more, and
-         * redo it if that happened. */
-        if (gx_fdt_probe (self, cur) != 0 || gx_fdt_mean (cur) >= self->fdt_abs)
-          {
-            gx_bg_save (self->bg_frame);           /* no finger: background good */
-            break;
-          }
+         * redo it if that happened.
+         *
+         * The probe alone is not enough: right after a capture it has
+         * reported no finger with one pressed, and that background, saved,
+         * was reused by the next sessions, each scoring 0 to 6 against a
+         * template that matched at 25 and more with a clean one. So the
+         * frame itself must also be no darker than the clean one on file. */
+        {
+          gboolean lifted = gx_fdt_probe (self, cur) != 0 ||
+                            gx_fdt_mean (cur) >= self->fdt_abs;
+          double ref = gx_bg_ref_mean ();
+          double mean = gx_frame_mean (self->bg_frame);
+
+          if (lifted && ref > 0 && mean < ref - GX_BG_FINGER_SHIFT)
+            {
+              fp_info ("background at %.0f against %.0f on file: finger "
+                       "on the sensor, not kept", mean, ref);
+              lifted = FALSE;
+              if (++rejected >= 2)
+                timeout = TRUE;
+            }
+          if (lifted)
+            {
+              gx_bg_save (self->bg_frame);         /* no finger: background good */
+              break;
+            }
+        }
         if (timeout)
           {
             /* The finger landed after the first probe and stayed: same case
