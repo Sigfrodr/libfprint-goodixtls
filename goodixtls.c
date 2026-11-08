@@ -1229,7 +1229,7 @@ gx_session_start (FpiDeviceGoodixTls *self)
 
   {
     int cur[12], waited = 0, age = 0, rejected = 0;
-    gboolean timeout = FALSE, reused = FALSE;
+    gboolean timeout = FALSE, reused = FALSE, down_at_start, retaken = FALSE;
     gint64 t0 = g_get_monotonic_time ();
 
     /* Finger already down and a recent clean background on file: use it
@@ -1266,6 +1266,7 @@ gx_session_start (FpiDeviceGoodixTls *self)
               }
           }
 
+        down_at_start = timeout;
         if (!gx_capture_avg (self, GOODIX_BG_FRAMES, self->bg_frame))
           return FALSE;
 
@@ -1277,13 +1278,27 @@ gx_session_start (FpiDeviceGoodixTls *self)
          * reported no finger with one pressed, and that background, saved,
          * was reused by the next sessions, each scoring 0 to 6 against a
          * template that matched at 25 and more with a clean one. So the
-         * frame itself must also be no darker than the clean one on file. */
+         * frame itself must also be no darker than the clean one on file.
+         *
+         * And a capture started with the finger still down holds it for most
+         * of its 1.5 s even when the finger is gone by the end: a finger
+         * lifted after the 2 s wait left such a background, judged clean,
+         * that blanked the next captures (contrast 5). The finger being up
+         * now, take it again rather than keep it. */
         {
           gboolean lifted = gx_fdt_probe (self, cur) != 0 ||
                             gx_fdt_mean (cur) >= self->fdt_abs;
           double ref = gx_bg_ref_mean ();
           double mean = gx_frame_mean (self->bg_frame);
 
+          if (lifted && down_at_start && !retaken)
+            {
+              fp_info ("finger lifted during the background capture: "
+                       "taking it again");
+              retaken = TRUE;
+              timeout = FALSE;
+              continue;
+            }
           if (lifted && ref > 0 && mean < ref - GX_BG_FINGER_SHIFT)
             {
               fp_info ("background at %.0f against %.0f on file: finger "
