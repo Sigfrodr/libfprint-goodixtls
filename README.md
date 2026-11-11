@@ -19,9 +19,9 @@ sensor's RAM through the `0xF2` memory command.
 ## At a glance
 
 - **Hardware** — Goodix **GXFP5187** (MateBook X Pro `MACH-WX9`, firmware
-  `GF3288_ST411SEC_APP_11033`) and Goodix **GXFP51A7** (MateBook 13 2019
-  `WRT-WX9`, MilanL chip `0x2205`, firmware `GF3288_ST411SEC_APP_14003`); both
-  SPI, TLS-PSK, 132×112.
+  `GF3288_ST411SEC_APP_11033` with TLS-CBC or `GF3288_ST411SEC_APP_11034` with
+  TLS-GCM) and Goodix **GXFP51A7** (MateBook 13 2019 `WRT-WX9`, MilanL chip
+  `0x2205`, firmware `GF3288_ST411SEC_APP_14003`); all SPI, TLS-PSK, 132×112.
 - **What works** — enrolment and verification through `fprintd` and GNOME
   Settings; session unlock and `sudo`. Open matcher, no NBIS, no Intel ME/SGX.
 - **Install** — `sudo ./install.sh` does everything (dependencies, build,
@@ -305,13 +305,12 @@ is read-only to it. The name starts with a dot so that it is never mistaken for
 a user directory.
 
 **The rule that makes adaptation safe**: the acquisition threshold
-(`GX_ADAPT_MIN`, **30**) is strictly above the decision threshold
-(`GX_MATCH_THRESHOLD`, **15**). Whoever triggers an acquisition is therefore
-already authenticating with twice the deciding margin, and about four times the
-best score any foreign finger has reached — adaptation never lowers the bar for
-an attacker, it only widens the coverage of someone who already passes. Without
-that rule, a doubtful acceptance would write itself durably into the template
-(template poisoning).
+(`GX_ADAPT_MIN`) is **twice** the decision threshold for the template's size
+(`gx_match_threshold()`: 15, 18 or 20, so 30 to 40). Whoever triggers an
+acquisition is therefore already authenticating with twice the deciding margin
+— adaptation never lowers the bar for an attacker, it only widens the coverage
+of someone who already passes. Without that rule, a doubtful acceptance would
+write itself durably into the template (template poisoning).
 
 The ceiling is **relative** (60 % of the capture's keypoints) and not
 absolute: the score depends on how rich the template is — measured, a 30-view
@@ -320,8 +319,19 @@ ceiling stops qualifying anything at all as soon as the template improves.
 Beyond that, the pressed zone is already well covered and one more view would
 teach nothing. Observed: a press at 118 is not retained, a press at 34 is.
 
-Ceiling of 20 acquired views. The store is **wiped at every enrolment**: the
-acquired views had been acquired under the authority of the previous template.
+That ceiling is waived **once a day** (`GX_ADAPT_REFRESH_S`, 20 h without an
+acquisition): skin drifts between sessions — measured, a template scoring 94
+to 98 at enrolment fell to 9 to 21 ten days later — and a finger that always
+scores above the ceiling would otherwise leave the store with nothing recent
+when the drift arrives. The safety bound is not waived.
+
+Enrolled and acquired views together are capped at 30 (`GX_MAX_VIEWS`); once
+the store is full, a newly qualified view **replaces the oldest** rather than
+being dropped. The store is **wiped at every enrolment**: the acquired views
+had been acquired under the authority of the previous template. The driver
+also keeps the last 8 scores of each template and warns in the log (and in
+`gx-verify.py`) when their median falls below 1.5 times the threshold:
+re-enrolling is then advised.
 
 **Deleting a fingerprint.** `fprintd` erases its template itself and never
 informs the driver: our fingerprints are stored host-side
@@ -398,11 +408,21 @@ Yet the driver embeds **no modified cryptographic library**. `goodix_tls.c`
 lets the system's OpenSSL do the handshake and the writes (the 48-byte PSK goes
 through: its limit is 512), then derives the session keys from the master
 secret (`SSL_SESSION_get_master_key` and the two randoms, TLS 1.2 PRF) and
-**decrypts the large record itself** — AES-128-CBC, HMAC-SHA256, sequence
-number. That record never crosses the library, so its ceiling does not apply.
+**decrypts the large record itself** using the negotiated suite: AES-128-CBC
+with HMAC-SHA256, or AES-128-GCM. That record never crosses the library, so its
+ceiling does not apply. The MAC or authentication tag is verified before any
+plaintext is returned.
 
-The MAC is verified: a wrong byte or sequence number would make the read fail
-instead of silently producing a corrupted image.
+The firmware version determines the 48-byte PSK's RAM address:
+
+| Firmware | Cipher suite | PSK address |
+|---|---|---|
+| `GF3288_ST411SEC_APP_11033` | `PSK-AES128-CBC-SHA256` | `0x20007f0c` |
+| `GF3288_ST411SEC_APP_11034` | `PSK-AES128-GCM-SHA256` | `0x20012d68` |
+
+Firmware 11034 offers only GCM and returns zeros at the old PSK address. It
+also ignores a ServerHello containing a session ID, so TLS session resumption
+is disabled. Each connection uses a fresh TLS context.
 
 **Pitfall encountered**: OpenSSL groups several TLS records into a **single**
 BIO write call — the `ServerHello` group comes out as one 121-byte block
@@ -488,10 +508,21 @@ you close the fingerprint prompt to type your password.
 
 ## Building
 
+For a complete installation, including the required SPI buffer size and
+fprintd GPIO permissions, use:
+
+```bash
+sudo ./install.sh
+```
+
+The commands below only build and install the driver. The runtime settings
+in the next section are also required when installing manually.
+
 ```bash
 sudo apt install libfprint-2-tod-dev meson ninja-build
-meson setup build
+meson setup build --sysconfdir=/etc
 ninja -C build
+sudo systemctl stop fprintd
 sudo ninja -C build install     # -> /usr/lib/x86_64-linux-gnu/libfprint-2/tod-1/
 ```
 
@@ -575,12 +606,42 @@ sysfs path containing `GXFP5187`. The `spidev` driver must therefore be bound
 to the sensor:
 
 ```bash
+(
+set -e
 DEV=spi-GXFP5187:00
-sudo modprobe spidev
+sudo systemctl stop fprintd
+echo 'options spidev bufsiz=65536' | sudo tee /etc/modprobe.d/goodixtls-spidev.conf
+echo spidev | sudo tee /etc/modules-load.d/goodixtls-spidev.conf
+# If spidev is already loaded, unload it so the new buffer size takes effect.
+if [ -d /sys/module/spidev ]; then
+    sudo modprobe -r spidev
+fi
+sudo modprobe spidev bufsiz=65536
 echo spidev | sudo tee /sys/bus/spi/devices/$DEV/driver_override
-echo $DEV   | sudo tee /sys/bus/spi/drivers/spidev/bind
+if [ ! -e /sys/bus/spi/devices/$DEV/driver ]; then
+    echo "$DEV" | sudo tee /sys/bus/spi/drivers/spidev/bind
+fi
+sudo mkdir -p /etc/systemd/system/fprintd.service.d
+sudo tee /etc/systemd/system/fprintd.service.d/goodixtls.conf <<'EOF'
+[Service]
+DeviceAllow=/dev/gpiochip0 rw
+RuntimeDirectory=goodixtls
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+EOF
+sudo systemctl daemon-reload
 sudo systemctl restart fprintd     # libfprint only enumerates at startup
+)
 ```
+
+`cat /sys/module/spidev/parameters/bufsiz` must report at least `65536`.
+A buffer of `4096` cannot carry the sensor's image frames. The GPIO allowance
+is needed for hardware reset: without it, fprintd logs `reset: cannot open
+/dev/gpiochip0 (Operation not permitted)` and sensor initialisation can fail.
+
+Close the fingerprint page in GNOME Settings or KDE System Settings before
+running `fprintd-enroll`: it holds an exclusive claim on the reader. An open
+settings page can cause `net.reactivated.Fprint.Error.AlreadyInUse`.
 
 `install.sh` lays down the udev rule `60-libfprint-2-goodixtls.rules`, which
 redoes this bind every time the device appears. (On this hardware the sensor
@@ -621,6 +682,17 @@ context is initialised**, so an `fprintd` started while the node did not yet
 exist stays blind even once the bind is restored. It has to be restarted.
 
 ## Testing
+
+TLS tests use synthetic keys and do not require a sensor:
+
+```bash
+meson test -C build --print-errorlogs
+```
+
+They cover CBC and GCM interoperability with OpenSSL, oversized 22 kB records,
+authentication failures, replay rejection and output bounds.
+
+Hardware open test:
 
 ```bash
 gcc test-open.c -o test-open $(pkg-config --cflags --libs libfprint-2)

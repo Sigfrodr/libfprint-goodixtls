@@ -85,7 +85,9 @@ gboolean gx_tls_write (GxTls        *tls,
 /* Reads ONE application-data record and decrypts it into @out.
  *
  * This deliberately bypasses OpenSSL, which would reject the oversized image
- * record. @raw is the record exactly as it came off the wire, header included.
+ * record. CBC/HMAC-SHA256 and GCM are selected from the negotiated suite;
+ * the MAC or authentication tag is verified before plaintext is returned.
+ * @raw is the record exactly as it came off the wire, header included.
  * Returns the plaintext length, or -1 on failure. */
 gssize gx_tls_decrypt_record (GxTls        *tls,
                               const guint8 *raw,

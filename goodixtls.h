@@ -57,13 +57,17 @@
  * the in-application-programming mode that other approaches rely on — and it is
  * non-destructive, unlike rewriting the key through IAP.
  *
- * TLS identity is "Client_identity", ciphersuite TLS-PSK-WITH-AES-128-CBC-SHA256.
+ * TLS identity is "Client_identity". Firmware 11033 uses
+ * TLS_PSK_WITH_AES_128_CBC_SHA256; firmware 11034 uses
+ * TLS_PSK_WITH_AES_128_GCM_SHA256.
  * Note the roles are reversed from what one might expect: the SENSOR is the TLS
  * client and the host is the server.
  */
-#define GOODIX_PSK_ADDR 0x20007f0c
+#define GOODIX_PSK_ADDR 0x20007f0c       /* GF3288_ST411SEC_APP_11033 */
+#define GOODIX_PSK_ADDR_11034 0x20012d68 /* GF3288_ST411SEC_APP_11034 */
 /* The address MOVES between firmware revisions of the same GF3288 generation:
- * 0x20007f14 on GF3288_ST411SEC_APP_14003 (GXFP51A7). Reading the wrong one
+ * 0x20012d68 on GF3288_ST411SEC_APP_11034 (GXFP5187), 0x20007f14 on
+ * GF3288_ST411SEC_APP_14003 (GXFP51A7). Reading the wrong one
  * does not fail loudly: it returns eight zeros and the first forty key bytes,
  * the read reports full length, and the only symptom is a handshake dying with
  * "cipher operation failed". Located on a GXFP51A7 by reading a 128-byte window

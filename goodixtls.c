@@ -1403,6 +1403,35 @@ gx_bg_load (guint16 *bg, int *age_s)
   return TRUE;
 }
 
+/* A finger pulls the whole raw frame down, by 500 to 800 counts on the
+ * reference unit (about 2700 empty, 1900 to 2200 with a finger), far more
+ * than the background moves between sessions. */
+#define GX_BG_FINGER_SHIFT 250
+
+static double
+gx_frame_mean (const guint16 *px)
+{
+  double s = 0;
+  int i;
+
+  for (i = 0; i < GOODIX_IMG_PIXELS; i++)
+    s += px[i];
+  return s / GOODIX_IMG_PIXELS;
+}
+
+/* Mean of the background on file whatever its age, or -1 without one. */
+static double
+gx_bg_ref_mean (void)
+{
+  g_autofree gchar *data = NULL;
+  gsize len = 0;
+
+  if (!g_file_get_contents (GX_BG_FILE, &data, &len, NULL) ||
+      len != sizeof (guint16) * GOODIX_IMG_PIXELS)
+    return -1;
+  return gx_frame_mean ((const guint16 *) data);
+}
+
 static void
 gx_bg_save (const guint16 *bg)
 {
@@ -1439,8 +1468,8 @@ gx_session_start (FpiDeviceGoodixTls *self)
     self->bg_frame = g_malloc (sizeof (guint16) * GOODIX_IMG_PIXELS);
 
   {
-    int cur[12], waited = 0, age = 0;
-    gboolean timeout = FALSE, reused = FALSE;
+    int cur[12], waited = 0, age = 0, rejected = 0;
+    gboolean timeout = FALSE, reused = FALSE, down_at_start, retaken = FALSE;
     gint64 t0 = g_get_monotonic_time ();
 
     /* Finger already down and a recent clean background on file: use it
@@ -1477,17 +1506,53 @@ gx_session_start (FpiDeviceGoodixTls *self)
               }
           }
 
+        down_at_start = timeout;
         if (!gx_capture_avg (self, GOODIX_BG_FRAMES, self->bg_frame))
           return FALSE;
 
         /* The capture itself lasts about 1.5 s, so a finger can land while it
          * runs and end up baked into the background. Check once more, and
-         * redo it if that happened. */
-        if (gx_fdt_probe (self, cur) != 0 || gx_fdt_mean (cur) >= self->fdt_abs)
-          {
-            gx_bg_save (self->bg_frame);           /* no finger: background good */
-            break;
-          }
+         * redo it if that happened.
+         *
+         * The probe alone is not enough: right after a capture it has
+         * reported no finger with one pressed, and that background, saved,
+         * was reused by the next sessions, each scoring 0 to 6 against a
+         * template that matched at 25 and more with a clean one. So the
+         * frame itself must also be no darker than the clean one on file.
+         *
+         * And a capture started with the finger still down holds it for most
+         * of its 1.5 s even when the finger is gone by the end: a finger
+         * lifted after the 2 s wait left such a background, judged clean,
+         * that blanked the next captures (contrast 5). The finger being up
+         * now, take it again rather than keep it. */
+        {
+          gboolean lifted = gx_fdt_probe (self, cur) != 0 ||
+                            gx_fdt_mean (cur) >= self->fdt_abs;
+          double ref = gx_bg_ref_mean ();
+          double mean = gx_frame_mean (self->bg_frame);
+
+          if (lifted && down_at_start && !retaken)
+            {
+              fp_info ("finger lifted during the background capture: "
+                       "taking it again");
+              retaken = TRUE;
+              timeout = FALSE;
+              continue;
+            }
+          if (lifted && ref > 0 && mean < ref - GX_BG_FINGER_SHIFT)
+            {
+              fp_info ("background at %.0f against %.0f on file: finger "
+                       "on the sensor, not kept", mean, ref);
+              lifted = FALSE;
+              if (++rejected >= 2)
+                timeout = TRUE;
+            }
+          if (lifted)
+            {
+              gx_bg_save (self->bg_frame);         /* no finger: background good */
+              break;
+            }
+        }
         if (timeout)
           {
             /* The finger landed after the first probe and stayed: same case
@@ -1762,12 +1827,33 @@ gx_views_from_print (FpPrint *print)
  * Above 60 % of points explained the pressed area is already well covered and
  * one more view would teach nothing. */
 #define GX_ADAPT_MAX_FRAC 0.60
+/* ...except once a day. Skin drifts between sessions — measured, a template
+ * scoring 94 to 98 at enrolment fell to 9 to 21 ten days later — and a finger
+ * that keeps scoring above the ceiling never teaches the store anything, so it
+ * has nothing recent to fall back on when the drift arrives. A confident
+ * capture therefore also qualifies when no view has been acquired for this
+ * long; the safety bound below is unchanged. */
+#define GX_ADAPT_REFRESH_S (20 * 3600)
 /* The store must live INSIDE fprintd's state directory: its systemd unit
  * declares ProtectSystem=strict with StateDirectory=fprint, leaving the rest of
  * the filesystem read-only to it. The name starts with a dot so it can never be
  * taken for a user directory — fprintd only ever opens the directory named
  * after an authenticated user, and no account is named like this. */
 #define GX_ADAPT_DIR "/var/lib/fprint/.goodixtls-adapt"
+
+/* No view acquired for GX_ADAPT_REFRESH_S, judged on the store's mtime (every
+ * append or rewrite touches it); an empty store is always due. */
+static gboolean
+gx_adapt_due (const gchar *path)
+{
+  GStatBuf st;
+
+  if (!path)
+    return FALSE;
+  if (g_stat (path, &st) != 0)
+    return TRUE;
+  return time (NULL) - st.st_mtime >= GX_ADAPT_REFRESH_S;
+}
 
 /* Store path for a given template, or NULL when the template carries no usable
  * identity. The user name comes from fprintd; reject anything that could escape
@@ -2588,18 +2674,23 @@ gx_enroll_done (FpiSsm *ssm, FpDevice *dev, GError *error)
  * so captures — the sensor refuses long exchanges such as the memory read while
  * short commands still work. It then needs a reset, and from the third attempt
  * a full reopen of the spidev node to clear the kernel driver's state too. */
-/* The key's address moves between firmware revisions; GOODIXTLS_PSK_ADDR
-* overrides the model's, to bring up a new revision without a rebuild. */
+/* The key's address moves between firmware revisions: the model's default,
+ * the 11034 revision of the GXFP5187 elsewhere, and GOODIXTLS_PSK_ADDR
+ * overriding both, to bring up a new revision without a rebuild. */
 static guint32
-gx_psk_addr (FpiDeviceGoodixTls *self)
+gx_psk_addr (FpiDeviceGoodixTls *self, const gchar *fw)
 {
   const gchar *env = g_getenv ("GOODIXTLS_PSK_ADDR");
 
-  return env ? (guint32) g_ascii_strtoull (env, NULL, 0) : self->model->psk_addr;
+  if (env)
+    return (guint32) g_ascii_strtoull (env, NULL, 0);
+  if (g_str_equal (fw, "GF3288_ST411SEC_APP_11034"))
+    return GOODIX_PSK_ADDR_11034;
+  return self->model->psk_addr;
 }
 
 static gboolean
-gx_read_psk (FpiDeviceGoodixTls *self, const gchar *path)
+gx_read_psk (FpiDeviceGoodixTls *self, const gchar *path, guint32 psk_addr)
 {
   int att;
 
@@ -2611,7 +2702,7 @@ gx_read_psk (FpiDeviceGoodixTls *self, const gchar *path)
       while (gx_read_frame (self, &ty, junk, sizeof junk) > 0)
         ;
 
-      if (gx_mem_read (self, gx_psk_addr (self), GOODIX_PSK_LEN,
+      if (gx_mem_read (self, psk_addr, GOODIX_PSK_LEN,
                        self->psk) == GOODIX_PSK_LEN)
         {
           if (att > 1)
@@ -2669,6 +2760,7 @@ gx_dev_open (FpDevice *dev)
   GError *err = NULL;
   const gchar *path;
   gchar fw[64] = "";
+  guint32 psk_addr;
 
   /* Drop stores whose fprintd template was deleted meanwhile. */
   gx_adapt_sweep ();
@@ -2721,7 +2813,9 @@ gx_dev_open (FpDevice *dev)
 
   if (gx_read_fw_version (self, fw, sizeof fw))
     fp_info ("%s firmware: %s", self->model->acpi_id, fw);
-  if (!gx_read_psk (self, path))
+  psk_addr = gx_psk_addr (self, fw);
+  fp_dbg ("reading PSK from RAM address 0x%08x", psk_addr);
+  if (!gx_read_psk (self, path, psk_addr))
     fp_warn ("key read failed; the TLS channel cannot be opened");
 
   fpi_device_open_complete (dev, NULL);
@@ -2787,9 +2881,12 @@ gx_verify_done (FpiSsm *ssm, FpDevice *dev, GError *error)
      * Weak poses — precisely the ones missing from the template — are excluded
      * on purpose, being too uncertain to trust. They enter the window by
      * themselves as the store fills out and lifts their score, so coverage
-     * grows step by step without ever relaxing the safety constraint. */
+     * grows step by step without ever relaxing the safety constraint.
+     * Above the upper bound a capture still enters once a day, so the store
+     * keeps a recent view of a finger that otherwise scores too well. */
     if (best >= GX_ADAPT_MIN (t->threshold) &&
-        best <= (int) (GX_ADAPT_MAX_FRAC * t->probe->n) &&
+        (best <= (int) (GX_ADAPT_MAX_FRAC * t->probe->n) ||
+         gx_adapt_due (apath)) &&
         views->len < GX_MAX_VIEWS)
       {
         guint room = GX_MAX_VIEWS - views->len;

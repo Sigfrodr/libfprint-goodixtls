@@ -30,12 +30,16 @@
 
 #include "goodix_tls.h"
 
-/* TLS_PSK_WITH_AES_128_CBC_SHA256 key material. */
+/* TLS 1.2 PSK AES-128 suites used by firmware 11033 (CBC) and 11034 (GCM). */
 #define MAC_KEY_LEN 32
 #define ENC_KEY_LEN 16
 #define IV_LEN 16
 #define MAC_LEN 32
 #define KEY_BLOCK_LEN (2 * MAC_KEY_LEN + 2 * ENC_KEY_LEN)
+#define GCM_FIXED_IV_LEN 4
+#define GCM_EXPLICIT_IV_LEN 8
+#define GCM_TAG_LEN 16
+#define GCM_KEY_BLOCK_LEN (2 * ENC_KEY_LEN + 2 * GCM_FIXED_IV_LEN)
 
 struct _GxTls
 {
@@ -57,7 +61,9 @@ struct _GxTls
   guint8   client_key[ENC_KEY_LEN];
   guint8   server_mac[MAC_KEY_LEN];
   guint8   server_key[ENC_KEY_LEN];
+  guint8   client_iv[GCM_FIXED_IV_LEN];
   guint64  read_seq;
+  gboolean use_gcm;
   gboolean keys_ready;
 };
 
@@ -147,13 +153,32 @@ derive_keys (GxTls *t, GError **error)
 {
   SSL_SESSION *sess = SSL_get_session (t->ssl);
   guint8 master[48], cr[32], sr[32], seed[64], kb[KEY_BLOCK_LEN];
-  gsize n;
+  gsize n, key_block_len;
 
   if (!sess)
     {
       g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED, "no TLS session");
       return FALSE;
     }
+
+  switch (SSL_CIPHER_get_protocol_id (SSL_get_current_cipher (t->ssl)))
+    {
+    case 0x00a8:                      /* TLS_PSK_WITH_AES_128_GCM_SHA256 */
+      t->use_gcm = TRUE;
+      key_block_len = GCM_KEY_BLOCK_LEN;
+      break;
+
+    case 0x00ae:                      /* TLS_PSK_WITH_AES_128_CBC_SHA256 */
+      t->use_gcm = FALSE;
+      key_block_len = KEY_BLOCK_LEN;
+      break;
+
+    default:
+      g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                   "unsupported TLS cipher %s", SSL_get_cipher (t->ssl));
+      return FALSE;
+    }
+
   n = SSL_SESSION_get_master_key (sess, master, sizeof master);
   if (n != sizeof master)
     {
@@ -173,16 +198,27 @@ derive_keys (GxTls *t, GError **error)
   memcpy (seed, sr, 32);
   memcpy (seed + 32, cr, 32);
   tls_prf (master, sizeof master, "key expansion", seed, sizeof seed,
-           kb, sizeof kb);
+           kb, key_block_len);
 
-  memcpy (t->client_mac, kb, MAC_KEY_LEN);
-  memcpy (t->server_mac, kb + MAC_KEY_LEN, MAC_KEY_LEN);
-  memcpy (t->client_key, kb + 2 * MAC_KEY_LEN, ENC_KEY_LEN);
-  memcpy (t->server_key, kb + 2 * MAC_KEY_LEN + ENC_KEY_LEN, ENC_KEY_LEN);
+  if (t->use_gcm)
+    {
+      /* AEAD has no separate MAC keys. RFC 5288's four-byte fixed IVs
+       * follow the two encryption keys in the TLS 1.2 key block. */
+      memcpy (t->client_key, kb, ENC_KEY_LEN);
+      memcpy (t->server_key, kb + ENC_KEY_LEN, ENC_KEY_LEN);
+      memcpy (t->client_iv, kb + 2 * ENC_KEY_LEN, GCM_FIXED_IV_LEN);
+    }
+  else
+    {
+      memcpy (t->client_mac, kb, MAC_KEY_LEN);
+      memcpy (t->server_mac, kb + MAC_KEY_LEN, MAC_KEY_LEN);
+      memcpy (t->client_key, kb + 2 * MAC_KEY_LEN, ENC_KEY_LEN);
+      memcpy (t->server_key, kb + 2 * MAC_KEY_LEN + ENC_KEY_LEN, ENC_KEY_LEN);
+    }
 
   /* Sequence numbers restart at zero when the cipher state changes, and the
    * Finished message is the first record under the new keys. Application data
-   * from the sensor therefore starts at 1. The MAC check below will tell us
+   * from the sensor therefore starts at 1. Record authentication will tell us
    * loudly if that assumption ever stops holding. */
   t->read_seq = 1;
   t->keys_ready = TRUE;
@@ -240,24 +276,25 @@ gx_tls_handshake_run (GxTls *t, GError **error)
       return FALSE;
     }
 
-  /* The sensor only speaks TLS 1.2 with a PSK CBC suite. Those are below
-   * OpenSSL's default security level, hence SECLEVEL=0 — appropriate here,
-   * where the cipher choice is the peer's and not ours to improve. */
+  /* Firmware 11033 offers CBC, while 11034 offers only GCM. Keep the
+   * sensor's legacy TLS settings local to this SSL context. */
   SSL_CTX_set_min_proto_version (t->ctx, TLS1_2_VERSION);
   SSL_CTX_set_max_proto_version (t->ctx, TLS1_2_VERSION);
-  if (!SSL_CTX_set_cipher_list (t->ctx, "PSK-AES128-CBC-SHA256:@SECLEVEL=0"))
+  /* Every connection has its own context, so resumption is unused. Firmware
+   * 11034 also silently ignores a ServerHello containing a session ID. */
+  SSL_CTX_set_options (t->ctx, SSL_OP_NO_TICKET);
+  SSL_CTX_set_session_cache_mode (t->ctx, SSL_SESS_CACHE_OFF);
+  if (!SSL_CTX_set_cipher_list (t->ctx,
+                                "PSK-AES128-GCM-SHA256:PSK-AES128-CBC-SHA256:@SECLEVEL=0"))
     {
       g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
-                   "PSK-AES128-CBC-SHA256 unavailable in this OpenSSL build");
+                   "PSK AES-128 GCM/CBC unavailable in this OpenSSL build");
       return FALSE;
     }
   SSL_CTX_set_psk_server_callback (t->ctx, psk_server_cb);
-  /* No session tickets: the MCU's record accounting has no room for a
-   * NewSessionTicket after the handshake. The GXFP5187 never asks for one, so
-   * this changes nothing there; it was tried on the GXFP51A7 as a cause of its
-   * 0xD0 reconnect aborts. The identity hint below, which makes OpenSSL send a
-   * ServerKeyExchange, is required: without it the MilanL gate stays closed. */
-  SSL_CTX_set_options (t->ctx, SSL_OP_NO_TICKET);
+  /* Tickets are off above. The identity hint below, which makes OpenSSL send
+   * a ServerKeyExchange, is required: without it the MilanL gate stays
+   * closed. */
   if (t->identity)
     SSL_CTX_use_psk_identity_hint (t->ctx, t->identity);
 
@@ -280,17 +317,33 @@ gx_tls_handshake_run (GxTls *t, GError **error)
   BIO_set_data (bio, t);
   SSL_set_bio (t->ssl, bio, bio);          /* SSL takes ownership */
 
+  ERR_clear_error ();
   r = SSL_accept (t->ssl);
   if (r != 1)
     {
+      int ssl_error = SSL_get_error (t->ssl, r);
       unsigned long e = ERR_get_error ();
       char buf[256] = "";
+      g_autoptr(GString) offered = g_string_new (NULL);
+      STACK_OF (SSL_CIPHER) * ciphers = SSL_get_client_ciphers (t->ssl);
+
+      for (int i = 0; i < sk_SSL_CIPHER_num (ciphers); i++)
+        {
+          const SSL_CIPHER *cipher = sk_SSL_CIPHER_value (ciphers, i);
+
+          if (offered->len)
+            g_string_append (offered, ", ");
+          g_string_append_printf (offered, "%s (0x%04x)",
+                                  SSL_CIPHER_get_name (cipher),
+                                  SSL_CIPHER_get_protocol_id (cipher));
+        }
 
       if (e)
         ERR_error_string_n (e, buf, sizeof buf);
       g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
-                   "TLS handshake failed (%d/%d) %s", r,
-                   SSL_get_error (t->ssl, r), buf);
+                   "TLS handshake failed (%d/%d) %s; state: %s; sensor ciphers: %s",
+                   r, ssl_error, buf, SSL_state_string_long (t->ssl),
+                   offered->len ? offered->str : "not received");
       return FALSE;
     }
   return derive_keys (t, error);
@@ -312,6 +365,62 @@ gx_tls_write (GxTls *t, const guint8 *buf, gsize len)
 /*  Record decryption                                                  */
 /* ------------------------------------------------------------------ */
 
+static void
+record_aad (GxTls *t, const guint8 *raw, gsize content_len, guint8 hdr[13])
+{
+  for (int i = 0; i < 8; i++)
+    hdr[i] = (guint8) (t->read_seq >> (56 - 8 * i));
+  memcpy (hdr + 8, raw, 3);           /* content type and TLS version */
+  hdr[11] = (guint8) (content_len >> 8);
+  hdr[12] = (guint8) content_len;
+}
+
+static gssize
+decrypt_gcm_record (GxTls *t, const guint8 *raw, gsize body_len,
+                    guint8 *out, gsize out_cap)
+{
+  const guint8 *body = raw + 5;
+  guint8 nonce[GCM_FIXED_IV_LEN + GCM_EXPLICIT_IV_LEN], aad[13];
+  g_autofree guint8 *plain = NULL;
+  gsize content_len;
+  EVP_CIPHER_CTX *c;
+  int plain_len = 0, tmp = 0;
+  gboolean ok;
+
+  if (body_len < GCM_EXPLICIT_IV_LEN + GCM_TAG_LEN)
+    return -1;
+  content_len = body_len - GCM_EXPLICIT_IV_LEN - GCM_TAG_LEN;
+  if (content_len > out_cap)
+    return -1;
+
+  /* RFC 5288: salt from the key block, explicit nonce from the record.
+  * The AAD still uses the implicit record sequence, not that nonce. */
+  memcpy (nonce, t->client_iv, GCM_FIXED_IV_LEN);
+  memcpy (nonce + GCM_FIXED_IV_LEN, body, GCM_EXPLICIT_IV_LEN);
+  record_aad (t, raw, content_len, aad);
+  plain = g_malloc (MAX (content_len, 1));
+  c = EVP_CIPHER_CTX_new ();
+  if (!c)
+    return -1;
+  ok = EVP_DecryptInit_ex (c, EVP_aes_128_gcm (), NULL, NULL, NULL) &&
+       EVP_CIPHER_CTX_ctrl (c, EVP_CTRL_GCM_SET_IVLEN, sizeof nonce, NULL) &&
+       EVP_DecryptInit_ex (c, NULL, NULL, t->client_key, nonce) &&
+       EVP_DecryptUpdate (c, NULL, &tmp, aad, sizeof aad) &&
+       EVP_DecryptUpdate (c, plain, &plain_len, body + GCM_EXPLICIT_IV_LEN,
+                          (int) content_len) &&
+       EVP_CIPHER_CTX_ctrl (c, EVP_CTRL_GCM_SET_TAG, GCM_TAG_LEN,
+                            (gpointer) (body + GCM_EXPLICIT_IV_LEN + content_len)) &&
+       EVP_DecryptFinal_ex (c, plain + plain_len, &tmp);
+  EVP_CIPHER_CTX_free (c);
+  if (!ok || (gsize) (plain_len + tmp) != content_len)
+    return -1;
+
+  /* Do not expose unauthenticated plaintext or advance the sequence on failure. */
+  memcpy (out, plain, content_len);
+  t->read_seq++;
+  return (gssize) content_len;
+}
+
 gssize
 gx_tls_decrypt_record (GxTls *t, const guint8 *raw, gsize raw_len,
                        guint8 *out, gsize out_cap)
@@ -325,14 +434,22 @@ gx_tls_decrypt_record (GxTls *t, const guint8 *raw, gsize raw_len,
   unsigned int want_len = 0;
   gsize content_len, pad;
 
-  if (!t || !t->keys_ready || raw_len < 5 + IV_LEN + MAC_LEN)
+  if (!t || !t->keys_ready || raw_len < 5)
     return -1;
   if (raw[0] != 23)                         /* application data */
     return -1;
 
   body = raw + 5;
   body_len = ((gsize) raw[3] << 8) | raw[4];
-  if (body_len + 5 > raw_len || body_len < IV_LEN + MAC_LEN ||
+  if (body_len + 5 > raw_len)
+    return -1;
+  if (t->use_gcm)
+    {
+      if (raw[1] != 3 || raw[2] != 3 || body_len + 5 != raw_len)
+        return -1;
+      return decrypt_gcm_record (t, raw, body_len, out, out_cap);
+    }
+  if (body_len < IV_LEN + MAC_LEN ||
       (body_len - IV_LEN) % IV_LEN != 0)
     return -1;
 
@@ -373,11 +490,7 @@ gx_tls_decrypt_record (GxTls *t, const guint8 *raw, gsize raw_len,
    * MAC-verified, so it cannot admit a forged record, only step over a dropped
    * one (and an older number is never accepted, so nothing can be replayed).
    * From the GXFP51A7 bring-up (Sigfrodr/libfprint-goodixtls#4). */
-  hdr[8] = raw[0];
-  hdr[9] = raw[1];
-  hdr[10] = raw[2];
-  hdr[11] = (guint8) (content_len >> 8);
-  hdr[12] = (guint8) content_len;
+  record_aad (t, raw, content_len, hdr);
 
   for (guint64 seq = t->read_seq; seq <= t->read_seq + 32; seq++)
     {
@@ -423,6 +536,7 @@ gx_tls_free (GxTls *t)
   OPENSSL_cleanse (t->psk, sizeof t->psk);
   OPENSSL_cleanse (t->client_key, sizeof t->client_key);
   OPENSSL_cleanse (t->client_mac, sizeof t->client_mac);
+  OPENSSL_cleanse (t->client_iv, sizeof t->client_iv);
   g_free (t->identity);
   g_free (t);
 }
