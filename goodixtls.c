@@ -1264,6 +1264,18 @@ gx_session_start (FpiDeviceGoodixTls *self)
         while (!timeout && gx_fdt_probe (self, cur) == 0 &&
                gx_fdt_mean (cur) < self->fdt_abs)
           {
+            /* Same shortcut as above, taken on any probe and not only the
+             * first: right after the handshake the first probe has missed
+             * a resting finger, and the login screen then sat through the
+             * 2 s wait and a wasted background capture — 5 to 6 s with the
+             * finger down and nothing happening. */
+            if (self->fdt_known && gx_bg_load (self->bg_frame, &age))
+              {
+                fp_info ("finger down: using the background saved %d s ago",
+                         age);
+                reused = TRUE;
+                break;
+              }
             if (waited >= GX_BG_WAIT_MS)
               {
                 timeout = TRUE;
@@ -1274,6 +1286,8 @@ gx_session_start (FpiDeviceGoodixTls *self)
                 waited += 200;
               }
           }
+        if (reused)
+          break;
 
         down_at_start = timeout;
         if (!gx_capture_avg (self, GOODIX_BG_FRAMES, self->bg_frame))
