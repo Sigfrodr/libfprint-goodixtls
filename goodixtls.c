@@ -1587,12 +1587,33 @@ gx_views_from_print (FpPrint *print)
  * Above 60 % of points explained the pressed area is already well covered and
  * one more view would teach nothing. */
 #define GX_ADAPT_MAX_FRAC 0.60
+/* ...except once a day. Skin drifts between sessions — measured, a template
+ * scoring 94 to 98 at enrolment fell to 9 to 21 ten days later — and a finger
+ * that keeps scoring above the ceiling never teaches the store anything, so it
+ * has nothing recent to fall back on when the drift arrives. A confident
+ * capture therefore also qualifies when no view has been acquired for this
+ * long; the safety bound below is unchanged. */
+#define GX_ADAPT_REFRESH_S (20 * 3600)
 /* The store must live INSIDE fprintd's state directory: its systemd unit
  * declares ProtectSystem=strict with StateDirectory=fprint, leaving the rest of
  * the filesystem read-only to it. The name starts with a dot so it can never be
  * taken for a user directory — fprintd only ever opens the directory named
  * after an authenticated user, and no account is named like this. */
 #define GX_ADAPT_DIR "/var/lib/fprint/.goodixtls-adapt"
+
+/* No view acquired for GX_ADAPT_REFRESH_S, judged on the store's mtime (every
+ * append or rewrite touches it); an empty store is always due. */
+static gboolean
+gx_adapt_due (const gchar *path)
+{
+  GStatBuf st;
+
+  if (!path)
+    return FALSE;
+  if (g_stat (path, &st) != 0)
+    return TRUE;
+  return time (NULL) - st.st_mtime >= GX_ADAPT_REFRESH_S;
+}
 
 /* Store path for a given template, or NULL when the template carries no usable
  * identity. The user name comes from fprintd; reject anything that could escape
@@ -2584,9 +2605,12 @@ gx_verify_done (FpiSsm *ssm, FpDevice *dev, GError *error)
      * Weak poses — precisely the ones missing from the template — are excluded
      * on purpose, being too uncertain to trust. They enter the window by
      * themselves as the store fills out and lifts their score, so coverage
-     * grows step by step without ever relaxing the safety constraint. */
+     * grows step by step without ever relaxing the safety constraint.
+     * Above the upper bound a capture still enters once a day, so the store
+     * keeps a recent view of a finger that otherwise scores too well. */
     if (best >= GX_ADAPT_MIN (t->threshold) &&
-        best <= (int) (GX_ADAPT_MAX_FRAC * t->probe->n) &&
+        (best <= (int) (GX_ADAPT_MAX_FRAC * t->probe->n) ||
+         gx_adapt_due (apath)) &&
         views->len < GX_MAX_VIEWS)
       {
         guint room = GX_MAX_VIEWS - views->len;

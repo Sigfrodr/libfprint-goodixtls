@@ -278,13 +278,12 @@ is read-only to it. The name starts with a dot so that it is never mistaken for
 a user directory.
 
 **The rule that makes adaptation safe**: the acquisition threshold
-(`GX_ADAPT_MIN`, **30**) is strictly above the decision threshold
-(`GX_MATCH_THRESHOLD`, **15**). Whoever triggers an acquisition is therefore
-already authenticating with twice the deciding margin, and about four times the
-best score any foreign finger has reached — adaptation never lowers the bar for
-an attacker, it only widens the coverage of someone who already passes. Without
-that rule, a doubtful acceptance would write itself durably into the template
-(template poisoning).
+(`GX_ADAPT_MIN`) is **twice** the decision threshold for the template's size
+(`gx_match_threshold()`: 15, 18 or 20, so 30 to 40). Whoever triggers an
+acquisition is therefore already authenticating with twice the deciding margin
+— adaptation never lowers the bar for an attacker, it only widens the coverage
+of someone who already passes. Without that rule, a doubtful acceptance would
+write itself durably into the template (template poisoning).
 
 The ceiling is **relative** (60 % of the capture's keypoints) and not
 absolute: the score depends on how rich the template is — measured, a 30-view
@@ -293,8 +292,19 @@ ceiling stops qualifying anything at all as soon as the template improves.
 Beyond that, the pressed zone is already well covered and one more view would
 teach nothing. Observed: a press at 118 is not retained, a press at 34 is.
 
-Ceiling of 20 acquired views. The store is **wiped at every enrolment**: the
-acquired views had been acquired under the authority of the previous template.
+That ceiling is waived **once a day** (`GX_ADAPT_REFRESH_S`, 20 h without an
+acquisition): skin drifts between sessions — measured, a template scoring 94
+to 98 at enrolment fell to 9 to 21 ten days later — and a finger that always
+scores above the ceiling would otherwise leave the store with nothing recent
+when the drift arrives. The safety bound is not waived.
+
+Enrolled and acquired views together are capped at 30 (`GX_MAX_VIEWS`); once
+the store is full, a newly qualified view **replaces the oldest** rather than
+being dropped. The store is **wiped at every enrolment**: the acquired views
+had been acquired under the authority of the previous template. The driver
+also keeps the last 8 scores of each template and warns in the log (and in
+`gx-verify.py`) when their median falls below 1.5 times the threshold:
+re-enrolling is then advised.
 
 **Deleting a fingerprint.** `fprintd` erases its template itself and never
 informs the driver: our fingerprints are stored host-side
