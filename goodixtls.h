@@ -57,11 +57,14 @@
  * the in-application-programming mode that other approaches rely on — and it is
  * non-destructive, unlike rewriting the key through IAP.
  *
- * TLS identity is "Client_identity", ciphersuite TLS-PSK-WITH-AES-128-CBC-SHA256.
+ * TLS identity is "Client_identity". Firmware 11033 uses
+ * TLS_PSK_WITH_AES_128_CBC_SHA256; firmware 11034 uses
+ * TLS_PSK_WITH_AES_128_GCM_SHA256.
  * Note the roles are reversed from what one might expect: the SENSOR is the TLS
  * client and the host is the server.
  */
-#define GOODIX_PSK_ADDR 0x20007f0c
+#define GOODIX_PSK_ADDR 0x20007f0c       /* GF3288_ST411SEC_APP_11033 */
+#define GOODIX_PSK_ADDR_11034 0x20012d68 /* GF3288_ST411SEC_APP_11034 */
 #define GOODIX_PSK_LEN 48
 #define GOODIX_TLS_IDENTITY "Client_identity"
 

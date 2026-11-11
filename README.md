@@ -18,7 +18,8 @@ sensor's RAM through the `0xF2` memory command.
 ## At a glance
 
 - **Hardware** — Goodix **GXFP5187** SPI sensor (ACPI id `GXFP5187`), as found in
-  the Huawei MateBook X Pro (`MACH-WX9`); firmware `GF3288_ST411SEC_APP_11033`.
+  the Huawei MateBook X Pro (`MACH-WX9`); firmware `GF3288_ST411SEC_APP_11033`
+  (TLS-CBC) or `GF3288_ST411SEC_APP_11034` (TLS-GCM).
 - **What works** — enrolment and verification through `fprintd` and GNOME
   Settings; session unlock and `sudo`. Open matcher, no NBIS, no Intel ME/SGX.
 - **Install** — `sudo ./install.sh` does everything (dependencies, build,
@@ -370,11 +371,21 @@ Yet the driver embeds **no modified cryptographic library**. `goodix_tls.c`
 lets the system's OpenSSL do the handshake and the writes (the 48-byte PSK goes
 through: its limit is 512), then derives the session keys from the master
 secret (`SSL_SESSION_get_master_key` and the two randoms, TLS 1.2 PRF) and
-**decrypts the large record itself** — AES-128-CBC, HMAC-SHA256, sequence
-number. That record never crosses the library, so its ceiling does not apply.
+**decrypts the large record itself** using the negotiated suite: AES-128-CBC
+with HMAC-SHA256, or AES-128-GCM. That record never crosses the library, so its
+ceiling does not apply. The MAC or authentication tag is verified before any
+plaintext is returned.
 
-The MAC is verified: a wrong byte or sequence number would make the read fail
-instead of silently producing a corrupted image.
+The firmware version determines the 48-byte PSK's RAM address:
+
+| Firmware | Cipher suite | PSK address |
+|---|---|---|
+| `GF3288_ST411SEC_APP_11033` | `PSK-AES128-CBC-SHA256` | `0x20007f0c` |
+| `GF3288_ST411SEC_APP_11034` | `PSK-AES128-GCM-SHA256` | `0x20012d68` |
+
+Firmware 11034 offers only GCM and returns zeros at the old PSK address. It
+also ignores a ServerHello containing a session ID, so TLS session resumption
+is disabled. Each connection uses a fresh TLS context.
 
 **Pitfall encountered**: OpenSSL groups several TLS records into a **single**
 BIO write call — the `ServerHello` group comes out as one 121-byte block
@@ -520,6 +531,17 @@ context is initialised**, so an `fprintd` started while the node did not yet
 exist stays blind even once the bind is restored. It has to be restarted.
 
 ## Testing
+
+TLS tests use synthetic keys and do not require a sensor:
+
+```bash
+meson test -C build --print-errorlogs
+```
+
+They cover CBC and GCM interoperability with OpenSSL, oversized 22 kB records,
+authentication failures, replay rejection and output bounds.
+
+Hardware open test:
 
 ```bash
 gcc test-open.c -o test-open $(pkg-config --cflags --libs libfprint-2)

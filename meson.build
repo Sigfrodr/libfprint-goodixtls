@@ -12,6 +12,7 @@ cc = meson.get_compiler('c')
 
 libfprint_tod_dep = dependency('libfprint-2-tod-1')
 gmodule_dep = dependency('gmodule-2.0')
+gio_dep = dependency('gio-2.0')
 # udev.pc is gone on Ubuntu 26.04 (only libudev.pc remains). The dependency is
 # only used to locate the rules directory, which install.sh overrides anyway, so
 # it is optional with a conventional fallback.
@@ -46,6 +47,12 @@ goodixtls_driver = shared_module('goodixtls-tod-driver',
     install: true,
     install_dir: tod_driversdir,
 )
+
+tls_test = executable('test-tls',
+    sources: ['test-tls.c', 'goodix_tls.c'],
+    dependencies: [gio_dep, openssl_dep],
+)
+test('tls', tls_test)
 
 # Honour the sysconfdir prefix so an --destdir package install stays inside
 # DESTDIR, rather than writing to a hard-coded /etc.
