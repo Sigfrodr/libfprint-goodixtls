@@ -471,10 +471,21 @@ you close the fingerprint prompt to type your password.
 
 ## Building
 
+For a complete installation, including the required SPI buffer size and
+fprintd GPIO permissions, use:
+
+```bash
+sudo ./install.sh
+```
+
+The commands below only build and install the driver. The runtime settings
+in the next section are also required when installing manually.
+
 ```bash
 sudo apt install libfprint-2-tod-dev meson ninja-build
-meson setup build
+meson setup build --sysconfdir=/etc
 ninja -C build
+sudo systemctl stop fprintd
 sudo ninja -C build install     # -> /usr/lib/x86_64-linux-gnu/libfprint-2/tod-1/
 ```
 
@@ -485,12 +496,42 @@ sysfs path containing `GXFP5187`. The `spidev` driver must therefore be bound
 to the sensor:
 
 ```bash
+(
+set -e
 DEV=spi-GXFP5187:00
-sudo modprobe spidev
+sudo systemctl stop fprintd
+echo 'options spidev bufsiz=65536' | sudo tee /etc/modprobe.d/goodixtls-spidev.conf
+echo spidev | sudo tee /etc/modules-load.d/goodixtls-spidev.conf
+# If spidev is already loaded, unload it so the new buffer size takes effect.
+if [ -d /sys/module/spidev ]; then
+    sudo modprobe -r spidev
+fi
+sudo modprobe spidev bufsiz=65536
 echo spidev | sudo tee /sys/bus/spi/devices/$DEV/driver_override
-echo $DEV   | sudo tee /sys/bus/spi/drivers/spidev/bind
+if [ ! -e /sys/bus/spi/devices/$DEV/driver ]; then
+    echo "$DEV" | sudo tee /sys/bus/spi/drivers/spidev/bind
+fi
+sudo mkdir -p /etc/systemd/system/fprintd.service.d
+sudo tee /etc/systemd/system/fprintd.service.d/goodixtls.conf <<'EOF'
+[Service]
+DeviceAllow=/dev/gpiochip0 rw
+RuntimeDirectory=goodixtls
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+EOF
+sudo systemctl daemon-reload
 sudo systemctl restart fprintd     # libfprint only enumerates at startup
+)
 ```
+
+`cat /sys/module/spidev/parameters/bufsiz` must report at least `65536`.
+A buffer of `4096` cannot carry the sensor's image frames. The GPIO allowance
+is needed for hardware reset: without it, fprintd logs `reset: cannot open
+/dev/gpiochip0 (Operation not permitted)` and sensor initialisation can fail.
+
+Close the fingerprint page in GNOME Settings or KDE System Settings before
+running `fprintd-enroll`: it holds an exclusive claim on the reader. An open
+settings page can cause `net.reactivated.Fprint.Error.AlreadyInUse`.
 
 `install.sh` lays down the udev rule `60-libfprint-2-goodixtls.rules`, which
 redoes this bind every time the device appears. (On this hardware the sensor

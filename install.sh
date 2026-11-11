@@ -66,8 +66,30 @@ fi
 # --- 2. le pilote ----------------------------------------------------
 say "Building and installing the driver"
 cd "$HERE"
-[ -d build ] || meson setup build >/dev/null
+if [ -d build ]; then
+  meson configure build --sysconfdir=/etc >/dev/null
+else
+  meson setup build --sysconfdir=/etc >/dev/null
+fi
 ninja -C build >/dev/null
+
+# Do not replace a library that fprintd still has mapped or reload spidev
+# while it holds the device open. Restore a previously running daemon if any
+# later installation step fails.
+FPRINTD_WAS_ACTIVE=0
+if systemctl is-active --quiet fprintd; then
+  FPRINTD_WAS_ACTIVE=1
+fi
+restore_fprintd() {
+  local status=$?
+  if [ "$status" -ne 0 ] && [ "$FPRINTD_WAS_ACTIVE" -eq 1 ]; then
+    systemctl start fprintd || warn "Could not restore fprintd after installation failed."
+  fi
+  return "$status"
+}
+trap restore_fprintd EXIT
+systemctl stop fprintd
+
 ninja -C build install >/dev/null
 echo "Installed into $(pkg-config --variable=tod_driversdir libfprint-2-tod-1)"
 
@@ -82,8 +104,12 @@ echo "options spidev bufsiz=65536" > /etc/modprobe.d/goodixtls-spidev.conf
 # then fails and the sensor simply vanishes from fprintd.
 echo spidev > /etc/modules-load.d/goodixtls-spidev.conf
 
-modprobe -r spidev 2>/dev/null || true
+if [ -d /sys/module/spidev ]; then
+  modprobe -r spidev || die "Cannot unload spidev: close fingerprint applications and retry."
+fi
 modprobe spidev bufsiz=65536
+[ "$(cat /sys/module/spidev/parameters/bufsiz)" -ge 65536 ] || \
+  die "spidev buffer is too small; reload the module before enrolling."
 
 # The udev rule redoes this bind every time the SPI device appears (boot, or
 # a rebind after gx-recover.sh).
@@ -147,6 +173,7 @@ else
 fi
 
 systemctl restart fprintd
+trap - EXIT
 say "Done"
 cat <<EOF
 Enrol a finger, with zone-by-zone guidance:
